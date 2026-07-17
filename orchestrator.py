@@ -5,10 +5,10 @@ import os
 from pathlib import Path
 from typing import Any, Mapping
 
-from .agents import AgentError, AgentSet
-from .config_utils import append_jsonl, apply_changes, read_jsonl, write_json
-from .runner import run_trial
-from .validator import editable_parameters, validate_candidate
+from agents import AgentError, AgentSet
+from config_utils import append_jsonl, apply_changes, read_jsonl, write_json
+from runner import run_trial
+from validator import editable_parameters, validate_candidate
 
 
 def _metric_mean(trial: Mapping[str, Any], *path: str) -> float | None:

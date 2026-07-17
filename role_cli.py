@@ -8,10 +8,10 @@ from pathlib import Path
 
 
 if __package__ in {None, ""}:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from verl_agent.agents import AgentSet
-from verl_agent.config_utils import load_json, write_json
+from agents import AgentSet
+from config_utils import load_json, write_json
 
 
 ROOT = Path(__file__).resolve().parent

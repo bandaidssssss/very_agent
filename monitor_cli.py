@@ -8,10 +8,10 @@ from pathlib import Path
 
 
 if __package__ in {None, ""}:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from verl_agent.config_utils import write_json
-from verl_agent.metrics import analyze_trial
+from config_utils import write_json
+from metrics import analyze_trial
 
 
 def main() -> int:
