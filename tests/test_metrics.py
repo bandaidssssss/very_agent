@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from verl_agent.metrics import analyze_trial, compute_threshold_stats, parse_step_records
+from metrics import analyze_trial, compute_threshold_stats, parse_step_records
 
 
 class MetricsTest(unittest.TestCase):

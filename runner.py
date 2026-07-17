@@ -12,8 +12,8 @@ import time
 from pathlib import Path
 from typing import Any, Mapping
 
-from .config_utils import hydra_overrides, write_json
-from .metrics import analyze_trial
+from config_utils import hydra_overrides, write_json
+from metrics import analyze_trial
 
 
 STEP_RE = re.compile(r"step:(\d+)")

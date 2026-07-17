@@ -9,10 +9,10 @@ from pathlib import Path
 
 
 if __package__ in {None, ""}:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from verl_agent.config_utils import load_json
-from verl_agent.orchestrator import TuningOrchestrator
+from config_utils import load_json
+from orchestrator import TuningOrchestrator
 
 
 ROOT = Path(__file__).resolve().parent

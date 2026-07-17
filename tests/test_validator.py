@@ -3,8 +3,8 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from verl_agent.config_utils import load_json
-from verl_agent.validator import validate_candidate
+from config_utils import load_json
+from validator import validate_candidate
 
 
 class ValidatorTest(unittest.TestCase):

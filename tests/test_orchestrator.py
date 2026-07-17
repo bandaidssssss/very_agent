@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from verl_agent.orchestrator import determine_stage
+from orchestrator import determine_stage
 
 
 def hardware_trial(trial_id: int, throughput: float, result: str = "success") -> dict:

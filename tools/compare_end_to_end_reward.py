@@ -9,10 +9,10 @@ import sys
 from pathlib import Path
 
 
-AGENTS_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(AGENTS_ROOT))
+VERL_AGENT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(VERL_AGENT_ROOT))
 
-from verl_agent.metrics import compute_threshold_stats, parse_step_records
+from metrics import compute_threshold_stats, parse_step_records
 
 
 def summarize(path: str, thresholds: list[float], window: int, max_step: int | None) -> dict:

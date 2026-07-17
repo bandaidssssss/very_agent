@@ -5,7 +5,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 export PLATFORM=${PLATFORM:-V5000}
 export MAX_TRIALS=${MAX_TRIALS:-1}
 export OUTPUT_PATH=${OUTPUT_PATH:-${SCRIPT_DIR}/output}
-export PYTHONPATH="${SCRIPT_DIR}/..:${PYTHONPATH:-}"
+export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}"
 
 if [[ -z "${VERL_ENV_SCRIPT:-}" ]]; then
     PLATFORM_UPPER=$(printf '%s' "${PLATFORM}" | tr '[:lower:]' '[:upper:]')

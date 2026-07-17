@@ -75,7 +75,7 @@ PLATFORM=V5000 MAX_TRIALS=10 bash agents/verl_agent/run_circle.sh
 `tools/compare_end_to_end_reward.py` 是独立验收入口：
 
 ```bash
-PYTHONPATH=agents python3 agents/verl_agent/tools/compare_end_to_end_reward.py \
+PYTHONPATH=agents/verl_agent python3 agents/verl_agent/tools/compare_end_to_end_reward.py \
   --log base=path/to/base.log \
   --log candidate=path/to/candidate.log \
   --output reward_comparison.json
