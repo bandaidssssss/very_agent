@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# MetaX C550 compatibility environment derived from the reference verl script.
+
+export MACA_PATH=${MACA_PATH:-/opt/maca}
+export CUCC_PATH=${CUCC_PATH:-${MACA_PATH}/tools/cu-bridge}
+export CUDA_PATH=${CUDA_PATH:-${CUCC_PATH}}
+export MACA_CLANG_PATH=${MACA_CLANG_PATH:-${MACA_PATH}/mxgpu_llvm/bin}
+export PATH=${CUDA_PATH}/bin:${MACA_CLANG_PATH}:${PATH}
+export LD_LIBRARY_PATH=${MACA_PATH}/tools/cu-bridge/lib/:${MACA_PATH}/lib:${MACA_PATH}/ompi/lib:${MACA_PATH}/mxgpu_llvm/lib:${LD_LIBRARY_PATH:-}
+export PYTORCH_ENABLE_SAME_RAND_A100=1
+export PYTORCH_ENABLE_SAME_RANK_A100=1
+export SET_DEVICE_NUMA_PREFERRED=1
+export HYDRA_FULL_ERROR=1
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export MCPYTORCH_DISABLE_PRINT=1
+export MCCL_MAX_NCHANNELS=8
+export NVTE_FLASH_ATTN=1
+export NVTE_FUSED_ATTN=0
+export PYTHONUNBUFFERED=1
+export VERL_LOGGING_LEVEL=DEBUG
+
+unset PAGEABLE_MEMCPY_ASYNC
+unset PYTORCH_CUDA_ALLOC_CONF
+unset RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES
