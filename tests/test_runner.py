@@ -3,11 +3,12 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from runner import GPUSampler, PhaseTracker
+from runner import GPUSampler, HealthAgentWorker, PhaseTracker
 
 
 class GPUSamplerTest(unittest.TestCase):
@@ -33,6 +34,24 @@ class GPUSamplerTest(unittest.TestCase):
             sampler = GPUSampler(Path(directory) / "gpu.csv", PhaseTracker(), 1.0, "V5000")
             rows = sampler._query_rows()
         self.assertEqual(rows, [["0", "1024", "2048", "50"]])
+
+
+class HealthAgentWorkerTest(unittest.TestCase):
+    def test_agent_failure_is_returned_without_raising_in_caller(self) -> None:
+        def fail(_context):
+            raise RuntimeError("agent unavailable")
+
+        worker = HealthAgentWorker(fail)
+        self.assertTrue(worker.submit("event-1", {"health_event": {}}))
+        result = None
+        for _ in range(100):
+            result = worker.poll()
+            if result is not None:
+                break
+            time.sleep(0.001)
+        self.assertIsNotNone(result)
+        self.assertFalse((result or {}).get("ok"))
+        self.assertIn("agent unavailable", (result or {}).get("error", ""))
 
 
 if __name__ == "__main__":

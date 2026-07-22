@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -19,22 +20,40 @@ ROOT = Path(__file__).resolve().parent
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run one verl tuning agent role")
-    parser.add_argument("--role", choices=["proposal", "feasibility", "diagnosis"], required=True)
+    parser.add_argument(
+        "--role", choices=["proposal", "feasibility", "diagnosis", "train_health"], required=True
+    )
     parser.add_argument("--context", required=True)
     parser.add_argument("--output")
+    parser.add_argument("--trace-output", help="Optional full conversation/tool trace JSON")
+    parser.add_argument("--agent-config", default=str(ROOT / "config" / "agent_config.json"))
     parser.add_argument("--rules-only", action="store_true")
     args = parser.parse_args()
 
-    agents = AgentSet(ROOT, "rules" if args.rules_only else "llm")
+    agent_config = load_json(args.agent_config)
+    output_dir = Path(os.getenv("OUTPUT_PATH", str(agent_config.get("output_dir", "output"))))
+    if not output_dir.is_absolute():
+        output_dir = ROOT / output_dir
+    agents = AgentSet(
+        ROOT,
+        "rules" if args.rules_only else "llm",
+        agent_config,
+        output_dir / "trials.jsonl",
+    )
     context = load_json(args.context)
     if args.role == "proposal":
-        result = agents.propose(context)
+        run = agents.propose(context)
     elif args.role == "feasibility":
-        result = agents.review(context)
+        run = agents.review(context)
+    elif args.role == "diagnosis":
+        run = agents.diagnose(context)
     else:
-        result = agents.diagnose(context)
+        run = agents.assess_health(context)
+    result = run.result
     if args.output:
         write_json(args.output, result)
+    if args.trace_output:
+        write_json(args.trace_output, run.as_trace())
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 

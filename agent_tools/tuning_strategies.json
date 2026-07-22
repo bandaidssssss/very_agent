@@ -1,0 +1,95 @@
+{
+  "data": {
+    "rollout_memory_pressure": {
+      "evidence": ["rollout is memory_bottleneck", "rollout phase peak approaches the configured safety line", "OOM occurs during generate_sequences"],
+      "ordered_actions": [
+        "Reduce rollout.gpu_memory_utilization first when vLLM KV cache reservation is the dominant pressure.",
+        "Reduce rollout.max_num_batched_tokens or max_num_seqs when scheduling concurrency creates the peak.",
+        "Enable chunked prefill for long prompts; validate end-to-end throughput because scheduling overhead can increase.",
+        "Increase rollout TP only when weight/KV sharding benefits exceed added communication cost."
+      ],
+      "do_not": ["Do not infer phase safety from an idle live_gpu_snapshot.", "Do not change rollout.n during hardware tuning when the token budget is frozen."]
+    },
+    "actor_logprob_memory_pressure": {
+      "evidence": ["actor_log_prob is memory_bottleneck", "OOM occurs around compute_log_prob"],
+      "ordered_actions": [
+        "Reduce rollout.log_prob_micro_batch_size_per_gpu.",
+        "Keep remove-padding enabled for variable-length sequences.",
+        "Use actor parameter offload only if transfer overhead is acceptable.",
+        "Revisit actor TP after micro-batch changes; larger TP lowers per-rank model pressure but adds collectives."
+      ]
+    },
+    "ref_logprob_memory_pressure": {
+      "evidence": ["ref_log_prob is memory_bottleneck", "OOM occurs around compute_ref_log_prob"],
+      "ordered_actions": [
+        "Reduce ref.log_prob_micro_batch_size_per_gpu.",
+        "Keep ref.param_offload enabled if host memory and transfer bandwidth permit.",
+        "Increase ref TP/PP only with valid divisibility and measured communication trade-offs."
+      ]
+    },
+    "training_memory_pressure": {
+      "evidence": ["training is memory_bottleneck", "OOM occurs around update_actor"],
+      "ordered_actions": [
+        "Reduce actor.ppo_micro_batch_size_per_gpu while preserving mini-batch divisibility.",
+        "Enable or strengthen activation recomputation.",
+        "Keep sequence parallel and distributed optimizer enabled where supported.",
+        "Use optimizer/parameter offload for feasibility, then measure the transfer penalty before accepting it as throughput-optimal.",
+        "Increase actor TP or PP only after cheaper local-memory controls are exhausted."
+      ]
+    },
+    "low_gpu_utilization": {
+      "evidence": ["phase utilization is low while memory has headroom", "step time is high without memory pressure"],
+      "ordered_actions": [
+        "Identify the slowest phase before changing parameters.",
+        "Increase only the micro-batch or concurrency control owned by that phase.",
+        "For rollout, test max_num_batched_tokens/max_num_seqs before raising KV-cache reservation.",
+        "For actor/ref, increase micro batch one valid divisibility step at a time."
+      ]
+    },
+    "communication_bottleneck": {
+      "evidence": ["high TP/PP with low compute utilization", "distributed/NCCL/BKCL timing dominates", "larger sharding reduced throughput"],
+      "ordered_actions": [
+        "Prefer the smallest TP/PP that remains memory-feasible.",
+        "Keep each TP*PP group divisible into world size.",
+        "Compare end-to-end time, not one isolated phase, because actor, rollout, and ref use different layouts.",
+        "Treat backend-specific environment tuning as platform configuration, not an LLM-adjustable training parameter."
+      ]
+    },
+    "end_to_end_throughput": {
+      "evidence": ["hardware trial is feasible", "phase timings and phase memory are available"],
+      "ordered_actions": [
+        "Optimize the measured time_bottleneck while checking all four phase memory projections.",
+        "Keep workload token budget fixed so throughput comparisons remain fair.",
+        "Reject local wins that increase time_per_step or lower end-to-end throughput.",
+        "Require repeated improvement above the plateau threshold before keeping a more complex configuration."
+      ]
+    },
+    "kl_explosion": {
+      "evidence": ["actor PPO KL exceeds warning threshold", "reward degrades while KL rises"],
+      "ordered_actions": [
+        "Lower actor learning rate.",
+        "Increase KL loss coefficient conservatively when use_kl_loss is enabled.",
+        "Add warmup when instability occurs at the start of training.",
+        "Confirm over 50-100 updates; a few updates cannot establish RL stability."
+      ]
+    },
+    "reward_collapse": {
+      "evidence": ["recent reward slope is negative beyond threshold", "reward and entropy/clip metrics show degeneration"],
+      "ordered_actions": [
+        "Lower learning rate first.",
+        "Inspect KL, entropy, pg_loss, and clipfrac together before changing KL or entropy controls.",
+        "Avoid changing hardware parameters during stability tuning.",
+        "Use one causal hypothesis per trial and preserve successful hardware settings."
+      ]
+    },
+    "platform_portability": {
+      "evidence": ["moving between V5000, NVIDIA, or MetaX C550", "SMI or communication backend differs"],
+      "ordered_actions": [
+        "Select the platform environment script outside the LLM parameter space.",
+        "Use GPU_SMI only as a fixed command override.",
+        "Re-run a short resource gate on every hardware family before trusting old memory observations.",
+        "Do not transfer absolute memory percentages across devices with different capacity or runtime allocators."
+      ]
+    }
+  }
+}

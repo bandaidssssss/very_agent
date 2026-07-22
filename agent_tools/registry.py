@@ -1,0 +1,403 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Mapping
+
+from agent_tools.memory_estimator import estimate_phase_memory
+
+
+@dataclass(frozen=True)
+class ToolRuntime:
+    root: Path
+    agent_config: Mapping[str, Any]
+    context: Mapping[str, Any]
+    history_path: Path
+
+
+class ToolError(RuntimeError):
+    pass
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+
+def _number(value: str) -> float:
+    match = re.search(r"[-+]?\d*\.?\d+", value.replace(",", ""))
+    if not match:
+        raise ValueError(f"cannot parse numeric GPU field: {value}")
+    return float(match.group(0))
+
+
+def _nested_metric(trial: Mapping[str, Any], *path: str) -> float | None:
+    value: Any = trial
+    for key in path:
+        if not isinstance(value, Mapping):
+            return None
+        value = value.get(key)
+    if isinstance(value, Mapping):
+        value = value.get("mean")
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+class ToolRegistry:
+    def __init__(self, root: str | Path, agent_config: Mapping[str, Any], history_path: str | Path) -> None:
+        self.root = Path(root).resolve()
+        self.agent_config = dict(agent_config)
+        self.history_path = Path(history_path).expanduser().resolve()
+        tool_root = self.root / "agent_tools"
+        self._skill_config = _load_json(tool_root / "skills.json")
+        self._parameter_docs = _load_json(tool_root / "parameter_docs.json")["data"]
+        self._strategies = _load_json(tool_root / "tuning_strategies.json")["data"]
+        self._handlers: dict[str, Callable[[Mapping[str, Any], ToolRuntime], Any]] = {
+            "parameter_understanding": self._parameter_understanding,
+            "tuning_strategies": self._tuning_strategies,
+            "memory_estimator": self._memory_estimator,
+            "live_gpu_snapshot": self._live_gpu_snapshot,
+            "search_verl_docs": self._search_verl_docs,
+            "query_trial_history": self._query_trial_history,
+            "read_trial_log_excerpt": self._read_trial_log_excerpt,
+        }
+
+    def definitions(self, role: str) -> list[dict[str, Any]]:
+        return [skill for skill in self._skill_config["skills"] if role in skill.get("roles", [])]
+
+    def api_schemas(self, role: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": skill["name"],
+                    "description": skill["description"],
+                    "parameters": skill["parameters"],
+                },
+            }
+            for skill in self.definitions(role)
+        ]
+
+    def runtime(self, context: Mapping[str, Any]) -> ToolRuntime:
+        return ToolRuntime(self.root, self.agent_config, context, self.history_path)
+
+    def execute(self, role: str, name: str, arguments: Mapping[str, Any], runtime: ToolRuntime) -> Any:
+        allowed = {skill["name"]: skill for skill in self.definitions(role)}
+        if name not in allowed or name not in self._handlers:
+            raise ToolError(f"tool {name!r} is not allowed for role {role!r}")
+        if not isinstance(arguments, Mapping):
+            raise ToolError("tool arguments must be an object")
+        return self._handlers[name](arguments, runtime)
+
+    def _parameter_understanding(self, arguments: Mapping[str, Any], runtime: ToolRuntime) -> dict[str, Any]:
+        del runtime
+        items = arguments.get("items")
+        if not isinstance(items, list) or not items or len(items) > 8:
+            raise ToolError("items must contain 1-8 parameter names")
+        found = {str(item): self._parameter_docs[str(item)] for item in items if str(item) in self._parameter_docs}
+        missing = [str(item) for item in items if str(item) not in self._parameter_docs]
+        return {"parameters": found, "unknown_parameters": missing}
+
+    def _tuning_strategies(self, arguments: Mapping[str, Any], runtime: ToolRuntime) -> dict[str, Any]:
+        del runtime
+        items = arguments.get("items")
+        if not isinstance(items, list) or not items or len(items) > 4:
+            raise ToolError("items must contain 1-4 strategy names")
+        found = {str(item): self._strategies[str(item)] for item in items if str(item) in self._strategies}
+        missing = [str(item) for item in items if str(item) not in self._strategies]
+        return {"strategies": found, "unknown_strategies": missing, "available": sorted(self._strategies)}
+
+    def _memory_estimator(self, arguments: Mapping[str, Any], runtime: ToolRuntime) -> dict[str, Any]:
+        context = runtime.context
+        current = context.get("current_parameters") or context.get("candidate_parameters") or {}
+        if not isinstance(current, Mapping):
+            raise ToolError("context does not contain current or candidate parameters")
+        candidate = dict(context.get("candidate_parameters") or current)
+        supplied = arguments.get("parameters", {})
+        changes = arguments.get("changes", {})
+        if supplied and not isinstance(supplied, Mapping):
+            raise ToolError("parameters must be an object")
+        if changes and not isinstance(changes, Mapping):
+            raise ToolError("changes must be an object")
+        candidate.update(supplied)
+        candidate.update(changes)
+
+        recent = context.get("recent_trials", [])
+        trials = list(recent) if isinstance(recent, list) else []
+        known_ids = {trial.get("trial_id") for trial in trials if isinstance(trial, Mapping)}
+        for trial in _read_jsonl(runtime.history_path):
+            if trial.get("trial_id") not in known_ids:
+                trials.append(trial)
+        limits = context.get("memory_limits", {})
+        constraints = context.get("constraints", {})
+        limit = None
+        if isinstance(limits, Mapping):
+            limit = limits.get("throughput") or limits.get("resource")
+        if limit is None and isinstance(constraints, Mapping):
+            limit = constraints.get("throughput_memory_limit_pct") or constraints.get("resource_memory_limit_pct")
+        limit = float(limit or runtime.agent_config.get("throughput_memory_limit_pct", 92.0))
+        reference_id = arguments.get("reference_trial_id")
+        if reference_id is not None and not isinstance(reference_id, int):
+            raise ToolError("reference_trial_id must be an integer")
+        result = estimate_phase_memory(current, candidate, trials, limit, reference_id)
+        result["candidate_changes"] = {
+            key: value for key, value in candidate.items() if current.get(key) != value
+        }
+        return result
+
+    def _live_gpu_snapshot(self, arguments: Mapping[str, Any], runtime: ToolRuntime) -> dict[str, Any]:
+        if arguments:
+            raise ToolError("live_gpu_snapshot takes no arguments")
+        platform = os.getenv("PLATFORM", str(runtime.agent_config.get("platform", "V5000"))).upper()
+        configured = os.getenv("GPU_SMI")
+        default = "xpu-smi" if platform == "V5000" else "mx-smi" if platform in {"C550", "METAX"} else "nvidia-smi"
+        executable = configured or shutil.which(default)
+        if not executable:
+            return {
+                "available": False,
+                "platform": platform,
+                "error": f"{default} was not found; set GPU_SMI to a compatible executable",
+                "interpretation": "No live snapshot. Use phase-tagged trial memory instead.",
+            }
+        timeout = min(10.0, max(1.0, float(runtime.agent_config.get("tool_timeout_seconds", 5.0))))
+        try:
+            proc = subprocess.run(
+                [
+                    executable,
+                    "--query-gpu=index,memory.used,memory.total,utilization.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            rows = []
+            if proc.returncode == 0:
+                for line in proc.stdout.splitlines():
+                    fields = [part.strip() for part in line.split(",")]
+                    if len(fields) == 4:
+                        rows.append(fields)
+            if not rows:
+                proc = subprocess.run(
+                    [executable], capture_output=True, text=True, timeout=timeout, check=False
+                )
+                output = proc.stdout
+                if platform in {"C550", "METAX"}:
+                    table_lines = [line for line in output.splitlines() if line.strip().startswith("|")]
+                    i = 0
+                    while i + 1 < len(table_lines):
+                        gpu_line = table_lines[i]
+                        mem_line = table_lines[i + 1]
+                        gpu_match = re.match(r"\|\s*(\d+)\s+", gpu_line)
+                        if not gpu_match:
+                            i += 1
+                            continue
+                        util_match = re.search(r"(\d+)%\s+(?:Disabled|Enabled)", gpu_line)
+                        mem_match = re.search(r"(\d+)/(\d+)\s*MiB", mem_line)
+                        if not mem_match:
+                            i += 2
+                            continue
+                        rows.append([
+                            gpu_match.group(1),
+                            mem_match.group(1),
+                            mem_match.group(2),
+                            util_match.group(1) if util_match else "0",
+                        ])
+                        i += 2
+                elif platform == "V5000":
+                    for index, line in enumerate(part for part in output.splitlines() if "Default" in part):
+                        fields = line.split()
+                        if len(fields) >= 13:
+                            rows.append([str(index), fields[8], fields[10], fields[12]])
+            gpus = []
+            for row in rows:
+                used, total, utilization = _number(row[1]), _number(row[2]), _number(row[3])
+                gpus.append(
+                    {
+                        "index": row[0],
+                        "memory_used_mb": used,
+                        "memory_total_mb": total,
+                        "memory_pct": round(100.0 * used / total, 2) if total else None,
+                        "utilization_pct": utilization,
+                    }
+                )
+            if not gpus:
+                return {
+                    "available": False,
+                    "platform": platform,
+                    "executable": executable,
+                    "error": (proc.stderr or proc.stdout or "GPU query returned no parseable rows")[-1000:],
+                    "interpretation": "Do not infer phase memory from this failed snapshot.",
+                }
+            return {
+                "available": True,
+                "timestamp_unix": time.time(),
+                "platform": platform,
+                "executable": executable,
+                "gpus": gpus,
+                "summary": {
+                    "max_memory_pct": max(gpu["memory_pct"] for gpu in gpus if gpu["memory_pct"] is not None),
+                    "mean_utilization_pct": round(sum(gpu["utilization_pct"] for gpu in gpus) / len(gpus), 2),
+                },
+                "interpretation": "Instantaneous host occupancy only; use trial phase samples for tuning decisions.",
+            }
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            return {"available": False, "platform": platform, "executable": executable, "error": str(exc)}
+
+    def _search_verl_docs(self, arguments: Mapping[str, Any], runtime: ToolRuntime) -> dict[str, Any]:
+        query = arguments.get("query")
+        if not isinstance(query, str) or len(query.strip()) < 2:
+            raise ToolError("query must contain at least two characters")
+        limit = arguments.get("max_results", 6)
+        if not isinstance(limit, int):
+            raise ToolError("max_results must be an integer")
+        limit = max(1, min(10, limit))
+        verl_root = Path(os.getenv("VERL_ROOT", str(runtime.agent_config.get("verl_root", "")))).expanduser().resolve()
+        if not verl_root.is_dir():
+            return {"available": False, "verl_root": str(verl_root), "error": "verl_root does not exist"}
+        candidates = [
+            verl_root / "verl" / "trainer" / "config",
+            verl_root / "verl" / "workers",
+            verl_root / "docs",
+            verl_root / "examples",
+        ]
+        allowed_roots = [path.resolve() for path in candidates if path.is_dir()]
+        suffixes = {".py", ".yaml", ".yml", ".md", ".rst"}
+        phrase = query.strip().lower()
+        terms = [term for term in re.findall(r"[a-zA-Z0-9_.]+", phrase) if len(term) >= 3]
+        matches: list[tuple[int, str, int, str]] = []
+        files_scanned = 0
+        for allowed in allowed_roots:
+            for path in allowed.rglob("*"):
+                if files_scanned >= 5000:
+                    break
+                if not path.is_file() or path.suffix.lower() not in suffixes:
+                    continue
+                try:
+                    if path.stat().st_size > 1_000_000:
+                        continue
+                    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                except OSError:
+                    continue
+                files_scanned += 1
+                for index, line in enumerate(lines):
+                    lowered = line.lower()
+                    score = (20 if phrase in lowered else 0) + sum(1 for term in terms if term in lowered)
+                    if score <= 0:
+                        continue
+                    start, end = max(0, index - 1), min(len(lines), index + 2)
+                    snippet = "\n".join(lines[start:end]).strip()
+                    relative = str(path.relative_to(verl_root))
+                    matches.append((score, relative, index + 1, snippet[:700]))
+        matches.sort(key=lambda item: (-item[0], item[1], item[2]))
+        return {
+            "available": True,
+            "verl_root": str(verl_root),
+            "query": query,
+            "files_scanned": files_scanned,
+            "matches": [
+                {"path": path, "line": line, "score": score, "snippet": snippet}
+                for score, path, line, snippet in matches[:limit]
+            ],
+        }
+
+    def _query_trial_history(self, arguments: Mapping[str, Any], runtime: ToolRuntime) -> dict[str, Any]:
+        trials = _read_jsonl(runtime.history_path)
+        stage = arguments.get("stage")
+        result = arguments.get("result")
+        failure_type = arguments.get("failure_type")
+        if stage:
+            trials = [trial for trial in trials if trial.get("stage") == stage]
+        if result:
+            trials = [trial for trial in trials if trial.get("result") == result]
+        if failure_type:
+            trials = [trial for trial in trials if trial.get("error", {}).get("type") == failure_type]
+        sort_by = arguments.get("sort_by", "trial_id")
+        metric_paths = {
+            "throughput": ("performance", "throughput"),
+            "reward": ("stability", "reward"),
+            "memory": ("resource", "max_observed_memory_pct"),
+        }
+        if sort_by == "trial_id":
+            trials.sort(key=lambda trial: int(trial.get("trial_id", 0)), reverse=True)
+        elif sort_by in metric_paths:
+            path = metric_paths[sort_by]
+            trials.sort(key=lambda trial: _nested_metric(trial, *path) or float("-inf"), reverse=True)
+        else:
+            raise ToolError(f"unsupported sort_by: {sort_by}")
+        limit = arguments.get("limit", 5)
+        if not isinstance(limit, int):
+            raise ToolError("limit must be an integer")
+        include_parameters = bool(arguments.get("include_parameters", False))
+        selected = []
+        for trial in trials[: max(1, min(10, limit))]:
+            row = {
+                "trial_id": trial.get("trial_id"),
+                "stage": trial.get("stage"),
+                "result": trial.get("result"),
+                "changes": trial.get("proposal", {}).get("changes"),
+                "performance": trial.get("performance"),
+                "resource": trial.get("resource"),
+                "memory_by_phase_pct": trial.get("memory_by_phase_pct"),
+                "stability": trial.get("stability"),
+                "error": trial.get("error"),
+                "diagnosis": trial.get("diagnosis"),
+            }
+            if include_parameters:
+                row["parameters"] = trial.get("parameters")
+            selected.append(row)
+        return {"history_path": str(runtime.history_path), "matched": len(trials), "trials": selected}
+
+    def _read_trial_log_excerpt(self, arguments: Mapping[str, Any], runtime: ToolRuntime) -> dict[str, Any]:
+        trial_id = arguments.get("trial_id")
+        if not isinstance(trial_id, int):
+            raise ToolError("trial_id must be an integer")
+        trial = next((row for row in _read_jsonl(runtime.history_path) if row.get("trial_id") == trial_id), None)
+        if not trial or not trial.get("log_path"):
+            return {"available": False, "trial_id": trial_id, "error": "trial or recorded log_path not found"}
+        log_path = Path(str(trial["log_path"])).expanduser().resolve()
+        allowed_root = runtime.history_path.parent.resolve()
+        try:
+            log_path.relative_to(allowed_root)
+        except ValueError as exc:
+            raise ToolError("recorded log path is outside the configured output directory") from exc
+        if not log_path.is_file():
+            return {"available": False, "trial_id": trial_id, "log_path": str(log_path), "error": "log not found"}
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        max_lines = arguments.get("max_lines", 20)
+        if not isinstance(max_lines, int):
+            raise ToolError("max_lines must be an integer")
+        max_lines = max(1, min(40, max_lines))
+        pattern = arguments.get("pattern")
+        if pattern:
+            if not isinstance(pattern, str) or len(pattern) > 120:
+                raise ToolError("pattern must be a string no longer than 120 characters")
+            selected = [(index + 1, line) for index, line in enumerate(lines) if pattern.lower() in line.lower()]
+            selected = selected[:max_lines]
+        else:
+            start = max(0, len(lines) - max_lines)
+            selected = [(index + 1, lines[index]) for index in range(start, len(lines))]
+        return {
+            "available": True,
+            "trial_id": trial_id,
+            "log_path": str(log_path),
+            "pattern": pattern,
+            "lines": [{"line": index, "text": line[:1200]} for index, line in selected],
+        }
