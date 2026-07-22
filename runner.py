@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import csv
 import os
+import queue
 import re
 import shutil
 import signal
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
-from config_utils import hydra_overrides, write_json
+from config_utils import append_jsonl, hydra_overrides, write_json
+from health_monitor import OnlineHealthMonitor, parse_online_step
 from metrics import analyze_trial
 
 
@@ -58,9 +59,14 @@ class GPUSampler(threading.Thread):
         self.interval = interval
         self.stop_event = threading.Event()
         self.max_memory_pct = 0.0
+        self._state_lock = threading.Lock()
+        self.latest_rows: list[dict[str, float | str]] = []
+        self.samples_written = 0
+        self.sample_errors = 0
+        self.last_sample_timestamp: float | None = None
         self.platform = os.getenv("PLATFORM", platform).upper()
         configured_smi = os.getenv("GPU_SMI")
-        default_smi = "xpu-smi" if self.platform == "V5000" else "nvidia-smi"
+        default_smi = "xpu-smi" if self.platform == "V5000" else "mx-smi" if self.platform in {"C550", "METAX"} else "nvidia-smi"
         self.executable = configured_smi or shutil.which(default_smi)
 
     @staticmethod
@@ -82,20 +88,48 @@ class GPUSampler(threading.Thread):
             timeout=max(1.0, self.interval),
             check=False,
         )
-        rows = []
+        rows: list[list[str]] = []
         if proc.returncode == 0:
             for line in proc.stdout.splitlines():
                 fields = [part.strip() for part in line.split(",")]
                 if len(fields) == 4:
                     rows.append(fields)
-        if rows or self.platform != "V5000":
+        if rows:
             return rows
 
-        # Older xpu-smi versions only expose the human-readable table.
+        # Fall back to human-readable table parsing.
         proc = subprocess.run(
             [self.executable], capture_output=True, text=True, timeout=max(1.0, self.interval), check=False
         )
-        for index, line in enumerate(part for part in proc.stdout.splitlines() if "Default" in part):
+        output = proc.stdout
+
+        # mx-smi (C550 / METAX): each GPU spans two table lines.
+        if self.platform in {"C550", "METAX"}:
+            table_lines = [line for line in output.splitlines() if line.strip().startswith("|")]
+            idx = 0
+            while idx + 1 < len(table_lines):
+                gpu_line = table_lines[idx]
+                mem_line = table_lines[idx + 1]
+                gpu_match = re.match(r"\|\s*(\d+)\s+", gpu_line)
+                if not gpu_match:
+                    idx += 1
+                    continue
+                util_match = re.search(r"(\d+)%\s+(?:Disabled|Enabled)", gpu_line)
+                mem_match = re.search(r"(\d+)/(\d+)\s*MiB", mem_line)
+                if not mem_match:
+                    idx += 2
+                    continue
+                rows.append([
+                    gpu_match.group(1),
+                    mem_match.group(1),
+                    mem_match.group(2),
+                    util_match.group(1) if util_match else "0",
+                ])
+                idx += 2
+            return rows
+
+        # Older xpu-smi versions only expose the human-readable table.
+        for index, line in enumerate(part for part in output.splitlines() if "Default" in part):
             fields = line.split()
             if len(fields) >= 13:
                 rows.append([str(index), fields[8], fields[10], fields[12]])
@@ -116,29 +150,117 @@ class GPUSampler(threading.Thread):
                         used, total = self._number(fields[1]), self._number(fields[2])
                         utilization = self._number(fields[3])
                         if total > 0:
-                            self.max_memory_pct = max(self.max_memory_pct, 100.0 * used / total)
-                        writer.writerow([now, self.tracker.get(), fields[0], used, total, utilization])
+                            memory_pct = 100.0 * used / total
+                            with self._state_lock:
+                                self.max_memory_pct = max(self.max_memory_pct, memory_pct)
+                                self.latest_rows.append(
+                                    {
+                                        "gpu_index": str(fields[0]),
+                                        "memory_used_mb": used,
+                                        "memory_total_mb": total,
+                                        "memory_pct": memory_pct,
+                                        "utilization_pct": utilization,
+                                    }
+                                )
+                            writer.writerow([now, self.tracker.get(), fields[0], used, total, utilization])
+                            with self._state_lock:
+                                self.samples_written += 1
+                                self.last_sample_timestamp = now
+                    with self._state_lock:
+                        if self.latest_rows:
+                            latest_by_gpu = {}
+                            for row in self.latest_rows:
+                                latest_by_gpu[str(row["gpu_index"])] = row
+                            self.latest_rows = list(latest_by_gpu.values())
                     handle.flush()
                 except (OSError, ValueError, subprocess.SubprocessError):
-                    pass
+                    with self._state_lock:
+                        self.sample_errors += 1
                 self.stop_event.wait(self.interval)
 
     def stop(self) -> None:
         self.stop_event.set()
 
+    def snapshot(self) -> dict[str, Any]:
+        with self._state_lock:
+            return {
+                "available": bool(self.executable),
+                "executable": self.executable,
+                "platform": self.platform,
+                "samples_written": self.samples_written,
+                "sample_errors": self.sample_errors,
+                "last_sample_timestamp": self.last_sample_timestamp,
+                "max_memory_pct": self.max_memory_pct,
+                "gpus": [dict(row) for row in self.latest_rows],
+            }
+
+
+HealthDecider = Callable[[Mapping[str, Any]], Mapping[str, Any]]
+
+
+class HealthAgentWorker:
+    """Run at most one health review at a time without blocking stdout reads."""
+
+    def __init__(self, decider: HealthDecider) -> None:
+        self.decider = decider
+        self._results: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._lock = threading.Lock()
+        self._pending = False
+
+    def submit(self, event_id: str, context: Mapping[str, Any]) -> bool:
+        with self._lock:
+            if self._pending:
+                return False
+            self._pending = True
+
+        def invoke() -> None:
+            try:
+                payload = dict(self.decider(context))
+                result = {"event_id": event_id, "ok": True, "payload": payload}
+            except Exception as exc:  # Agent failures must never stop training.
+                result = {
+                    "event_id": event_id,
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            self._results.put(result)
+
+        threading.Thread(target=invoke, name=f"health-agent-{event_id}", daemon=True).start()
+        return True
+
+    def poll(self) -> dict[str, Any] | None:
+        try:
+            result = self._results.get_nowait()
+        except queue.Empty:
+            return None
+        with self._lock:
+            self._pending = False
+        return result
+
+    def pending(self) -> bool:
+        with self._lock:
+            return self._pending
+
 
 def build_command(
-    parameters: Mapping[str, Any], agent_config: Mapping[str, Any], trial_id: int, updates: int
+    parameters: Mapping[str, Any],
+    agent_config: Mapping[str, Any],
+    trial_id: int,
+    updates: int,
+    stage: str | None = None,
 ) -> tuple[list[str], Path]:
     verl_root = Path(os.getenv("VERL_ROOT", str(agent_config["verl_root"]))).expanduser().resolve()
     run_parameters = dict(parameters)
+    save_freq = -1
+    if stage == "stability_tuning":
+        save_freq = int(agent_config.get("stability_checkpoint_freq", 5))
     run_parameters.update(
         {
             "trainer.total_training_steps": updates,
             "trainer.total_epochs": max(1, int(parameters.get("trainer.total_epochs", 1))),
             "trainer.experiment_name": f"verl_agent_trial_{trial_id:04d}",
             "trainer.logger": ["console"],
-            "trainer.save_freq": -1,
+            "trainer.save_freq": save_freq,
             "trainer.test_freq": -1,
             "trainer.val_before_train": False,
         }
@@ -178,16 +300,19 @@ def run_trial(
     stage: str,
     updates: int,
     dry_run: bool = False,
+    health_decider: HealthDecider | None = None,
 ) -> dict[str, Any]:
     output_root = Path(os.getenv("OUTPUT_PATH", str(agent_config["output_dir"]))).expanduser().resolve()
     trial_dir = output_root / "trials" / f"{trial_id:04d}"
     trial_dir.mkdir(parents=True, exist_ok=True)
     log_path = trial_dir / "train.log"
     samples_path = trial_dir / "gpu_samples.csv"
+    health_events_path = trial_dir / "health_events.jsonl"
+    health_traces_path = trial_dir / "health_agent_traces.jsonl"
     platform = os.getenv("PLATFORM", str(agent_config.get("platform", "V5000")))
     write_json(trial_dir / "parameters.json", dict(parameters))
 
-    command, cwd = build_command(parameters, agent_config, trial_id, updates)
+    command, cwd = build_command(parameters, agent_config, trial_id, updates, stage)
     write_json(trial_dir / "command.json", {"cwd": str(cwd), "argv": command})
     if dry_run:
         return {
@@ -213,6 +338,21 @@ def run_trial(
         float(agent_config.get("monitor_interval_seconds", 1.0)),
         platform,
     )
+    health_monitor = None
+    health_worker = None
+    if stage == "stability_tuning" and bool(agent_config.get("health_monitor_enabled", True)):
+        health_monitor = OnlineHealthMonitor(
+            kl_metric=str(agent_config.get("health_kl_metric", "actor/kl_loss")),
+            reward_metric=str(agent_config.get("health_reward_metric", "critic/rewards/mean")),
+            kl_growth_threshold=float(agent_config.get("health_kl_growth_threshold", 0.15)),
+            reward_drop_threshold=float(agent_config.get("health_reward_drop_threshold", 0.10)),
+            consecutive_steps=int(agent_config.get("health_consecutive_steps", 5)),
+            reward_zero_epsilon=float(agent_config.get("health_reward_zero_epsilon", 0.0)),
+            warmup_updates=int(agent_config.get("health_warmup_updates", 0)),
+            cooldown_updates=int(agent_config.get("health_agent_cooldown_updates", 5)),
+        )
+        if health_decider is not None:
+            health_worker = HealthAgentWorker(health_decider)
     process = subprocess.Popen(
         command,
         cwd=cwd,
@@ -225,6 +365,15 @@ def run_trial(
     )
     sampler.start()
     stop_reason = None
+    health_events: list[dict[str, Any]] = []
+    health_decisions: list[dict[str, Any]] = []
+    health_agent_calls = 0
+    pending_health_stop: dict[str, Any] | None = None
+    next_health_review_step = 0
+    # Zero means unlimited; cooldown and the single-flight worker still prevent storms.
+    max_health_calls = max(0, int(agent_config.get("health_agent_max_calls_per_trial", 0)))
+    stop_confidence = float(agent_config.get("health_agent_stop_confidence", 0.8))
+    shadow_mode = bool(agent_config.get("health_agent_shadow_mode", False))
     gate_updates = int(agent_config.get("resource_gate_updates", 5))
     hard_limit = float(agent_config.get("resource_memory_limit_pct", 95.0))
     try:
@@ -234,15 +383,139 @@ def run_trial(
                 log_handle.write(line)
                 log_handle.flush()
                 tracker.update_from_log(line)
+
+                agent_result = health_worker.poll() if health_worker is not None else None
+                if agent_result is not None:
+                    event_id = str(agent_result["event_id"])
+                    if agent_result.get("ok"):
+                        payload = agent_result.get("payload", {})
+                        decision = payload.get("decision", payload)
+                        trace = payload.get("trace")
+                        if not isinstance(decision, Mapping):
+                            decision = {}
+                        compact_decision = {
+                            "event_id": event_id,
+                            "verdict": decision.get("verdict"),
+                            "action": decision.get("action"),
+                            "confidence": decision.get("confidence"),
+                            "reason_codes": decision.get("reason_codes", []),
+                            "evidence": decision.get("evidence", []),
+                            "counterevidence": decision.get("counterevidence", []),
+                            "observe_for_updates": decision.get("observe_for_updates", 0),
+                            "reason": decision.get("reason"),
+                        }
+                        health_decisions.append(compact_decision)
+                        append_jsonl(
+                            health_events_path,
+                            {"record_type": "agent_decision", **compact_decision},
+                        )
+                        if trace is not None:
+                            append_jsonl(
+                                health_traces_path,
+                                {"event_id": event_id, "trace": trace},
+                            )
+                        observe_for = decision.get("observe_for_updates", 0)
+                        if isinstance(observe_for, int) and observe_for > 0:
+                            next_health_review_step = max(
+                                next_health_review_step,
+                                (health_monitor.last_step if health_monitor else 0) + observe_for,
+                            )
+                        confidence = decision.get("confidence")
+                        should_stop = (
+                            decision.get("verdict") == "unhealthy"
+                            and decision.get("action") == "stop"
+                            and isinstance(confidence, (int, float))
+                            and float(confidence) >= stop_confidence
+                        )
+                        if should_stop:
+                            compact_decision["shadow_mode"] = shadow_mode
+                            if not shadow_mode:
+                                pending_health_stop = compact_decision
+                    else:
+                        failure = {
+                            "event_id": event_id,
+                            "verdict": "insufficient_evidence",
+                            "action": "continue",
+                            "confidence": 0.0,
+                            "reason_codes": ["HEALTH_AGENT_ERROR"],
+                            "evidence": [],
+                            "counterevidence": [],
+                            "observe_for_updates": 0,
+                            "reason": agent_result.get("error"),
+                        }
+                        health_decisions.append(failure)
+                        append_jsonl(health_events_path, {"record_type": "agent_error", **failure})
+
                 if FATAL_RE.search(line):
                     stop_reason = "fatal_log"
                     _terminate(process)
                     break
+
+                parsed_step = parse_online_step(line)
                 step_match = STEP_RE.search(line)
-                if step_match and int(step_match.group(1)) >= gate_updates and sampler.max_memory_pct >= hard_limit:
+                current_step = int(step_match.group(1)) if step_match else None
+                if current_step is not None and pending_health_stop is not None:
+                    stop_reason = "health_agent_early_stop"
+                    append_jsonl(
+                        health_events_path,
+                        {
+                            "record_type": "stop_applied",
+                            "step": current_step,
+                            "decision": pending_health_stop,
+                        },
+                    )
+                    _terminate(process)
+                    break
+                if current_step is not None and current_step >= gate_updates and sampler.max_memory_pct >= hard_limit:
                     stop_reason = "resource_gate_memory_limit"
                     _terminate(process)
                     break
+                if parsed_step is not None and health_monitor is not None:
+                    step, step_metrics = parsed_step
+                    trigger = health_monitor.add_step(step, step_metrics)
+                    if trigger is not None:
+                        event_id = f"trial-{trial_id:04d}-step-{step:06d}-event-{len(health_events) + 1:03d}"
+                        event = {
+                            "event_id": event_id,
+                            "trial_id": trial_id,
+                            "stage": stage,
+                            "updates_target": updates,
+                            "trigger": trigger,
+                            "resource_snapshot": sampler.snapshot(),
+                            "parameters": dict(parameters),
+                        }
+                        health_events.append(event)
+                        append_jsonl(health_events_path, {"record_type": "rule_trigger", **event})
+                        eligible_for_agent = (
+                            health_worker is not None
+                            and (max_health_calls == 0 or health_agent_calls < max_health_calls)
+                            and step >= next_health_review_step
+                        )
+                        context = {
+                            "current_stage": stage,
+                            "mode": "online_health_review",
+                            "health_event": event,
+                            "recent_trials": [],
+                        }
+                        if eligible_for_agent and health_worker.submit(event_id, context):
+                            health_agent_calls += 1
+                        else:
+                            reason = (
+                                "agent_unavailable"
+                                if health_worker is None
+                                else "max_calls_reached"
+                                if max_health_calls > 0 and health_agent_calls >= max_health_calls
+                                else "review_deferred_or_pending"
+                            )
+                            append_jsonl(
+                                health_events_path,
+                                {
+                                    "record_type": "agent_not_submitted",
+                                    "event_id": event_id,
+                                    "step": step,
+                                    "reason": reason,
+                                },
+                            )
         return_code = process.wait()
     finally:
         sampler.stop()
@@ -268,9 +541,15 @@ def run_trial(
             "failure_phase": tracker.get() if stop_reason or return_code != 0 else None,
             "log_path": str(log_path),
             "gpu_samples_path": str(samples_path) if samples_path.exists() else None,
+            "health_events_path": str(health_events_path) if health_events_path.exists() else None,
+            "health_agent_traces_path": str(health_traces_path) if health_traces_path.exists() else None,
+            "health_monitor": health_monitor.summary() if health_monitor is not None else {"enabled": False},
+            "health_events": health_events,
+            "health_decisions": health_decisions,
         }
     )
-    if metrics["updates_completed"] < updates and not metrics["error"].get("type"):
+    health_early_stopped = stop_reason == "health_agent_early_stop"
+    if metrics["updates_completed"] < updates and not health_early_stopped and not metrics["error"].get("type"):
         metrics["error"] = {
             "type": "INCOMPLETE_TRAINING",
             "evidence": [f"completed {metrics['updates_completed']} of {updates} updates"],
@@ -283,7 +562,14 @@ def run_trial(
             "evidence": [f"observed phase memory {observed_memory:.2f}% exceeds {throughput_limit:.2f}%"],
         }
         metrics["result"] = "fail"
-    if return_code != 0 or stop_reason or metrics["updates_completed"] < updates:
+    if health_early_stopped:
+        metrics["result"] = "early_stopped"
+        metrics["termination"] = {
+            "type": "health_policy",
+            "step": metrics["updates_completed"],
+            "decision": pending_health_stop,
+        }
+    elif return_code != 0 or stop_reason or metrics["updates_completed"] < updates:
         metrics["result"] = "fail"
     write_json(trial_dir / "trial_report.json", metrics)
     return metrics

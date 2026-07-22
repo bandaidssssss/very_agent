@@ -1,0 +1,142 @@
+{
+  "skill_version": "2.0",
+  "description": "Allowlisted tools for the verl tuning agents",
+  "skills": [
+    {
+      "name": "parameter_understanding",
+      "handler": "parameter_understanding",
+      "roles": ["proposal", "feasibility", "diagnosis"],
+      "description": "Query curated verl parameter semantics, memory/throughput effects, interactions, and hard constraints. Query every parameter you intend to change when its effect is uncertain.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 8,
+            "items": {"type": "string"},
+            "description": "Complete Hydra parameter names to query"
+          }
+        },
+        "required": ["items"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "tuning_strategies",
+      "handler": "tuning_strategies",
+      "roles": ["proposal", "feasibility", "diagnosis"],
+      "description": "Query stage-aware strategies for a measured bottleneck or failure scenario.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4,
+            "items": {
+              "type": "string",
+              "enum": [
+                "rollout_memory_pressure",
+                "actor_logprob_memory_pressure",
+                "ref_logprob_memory_pressure",
+                "training_memory_pressure",
+                "low_gpu_utilization",
+                "communication_bottleneck",
+                "end_to_end_throughput",
+                "kl_explosion",
+                "reward_collapse",
+                "platform_portability"
+              ]
+            },
+            "description": "Scenario names to query"
+          }
+        },
+        "required": ["items"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "memory_estimator",
+      "handler": "memory_estimator",
+      "roles": ["proposal", "feasibility"],
+      "description": "Estimate rollout, actor-log-prob, ref-log-prob, and training memory. It anchors projections to phase-tagged trial measurements when available and otherwise returns only relative pressure.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "changes": {
+            "type": "object",
+            "description": "Candidate Hydra parameter changes relative to the current configuration",
+            "additionalProperties": true
+          },
+          "parameters": {
+            "type": "object",
+            "description": "Optional full or partial candidate parameter mapping",
+            "additionalProperties": true
+          },
+          "reference_trial_id": {
+            "type": "integer",
+            "description": "Optional explicit empirical reference trial"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "live_gpu_snapshot",
+      "handler": "live_gpu_snapshot",
+      "roles": ["proposal", "feasibility", "diagnosis"],
+      "description": "Read a safe instantaneous GPU snapshot through nvidia-smi, xpu-smi, or GPU_SMI. This is host occupancy evidence, not phase-specific training memory.",
+      "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
+    },
+    {
+      "name": "search_verl_docs",
+      "handler": "search_verl_docs",
+      "roles": ["proposal", "feasibility", "diagnosis"],
+      "description": "Search bounded local verl 0.7 documentation, config, examples, and worker source for parameter definitions or behavior.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {"type": "string", "minLength": 2, "description": "Parameter name or technical search phrase"},
+          "max_results": {"type": "integer", "minimum": 1, "maximum": 10, "default": 6}
+        },
+        "required": ["query"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "query_trial_history",
+      "handler": "query_trial_history",
+      "roles": ["proposal", "feasibility", "diagnosis", "train_health"],
+      "description": "Query the complete structured trial history with stage/result/failure filters and metric sorting.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "stage": {"type": "string"},
+          "result": {"type": "string", "enum": ["success", "fail"]},
+          "failure_type": {"type": "string"},
+          "sort_by": {"type": "string", "enum": ["trial_id", "throughput", "reward", "memory"], "default": "trial_id"},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
+          "include_parameters": {"type": "boolean", "default": false}
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "read_trial_log_excerpt",
+      "handler": "read_trial_log_excerpt",
+      "roles": ["diagnosis"],
+      "description": "Read a bounded excerpt from a log path already recorded for a trial. No arbitrary path is accepted.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "trial_id": {"type": "integer"},
+          "pattern": {"type": "string", "description": "Optional case-insensitive filter"},
+          "max_lines": {"type": "integer", "minimum": 1, "maximum": 40, "default": 20}
+        },
+        "required": ["trial_id"],
+        "additionalProperties": false
+      }
+    }
+  ]
+}

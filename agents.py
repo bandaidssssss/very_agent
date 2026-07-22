@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
+
+from agent_tools import ToolRegistry
+from prompting import render_prompt
 
 
 class AgentError(RuntimeError):
@@ -29,72 +34,339 @@ def _extract_json(text: str) -> dict[str, Any]:
     return value
 
 
+def _field(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _response_text(response: Any) -> str:
+    choice = response.choices[0]
+    content = choice.message.content
+    return content or ""
+
+
+def _tool_calls(response: Any) -> list[Any]:
+    choice = response.choices[0]
+    raw = list(choice.message.tool_calls or [])
+    normalized: list[dict[str, Any]] = []
+    for tc in raw:
+        func = _field(tc, "function", {})
+        normalized.append({
+            "name": _field(func, "name", ""),
+            "arguments": _field(func, "arguments", "{}"),
+        })
+    return normalized
+
+
+@dataclass
+class AgentConversation:
+    role: str
+    context: dict[str, Any]
+    messages: list[dict[str, Any]]
+    tool_trace: list[dict[str, Any]] = field(default_factory=list)
+    usage: dict[str, int] = field(
+        default_factory=lambda: {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "api_calls": 0}
+    )
+    completed_turns: int = 0
+
+    def add_user_message(self, content: str) -> None:
+        self.messages.append({"role": "user", "content": content})
+
+    def as_trace(self) -> dict[str, Any]:
+        return {
+            "role": self.role,
+            "context": copy.deepcopy(self.context),
+            "messages": copy.deepcopy(self.messages),
+            "tool_calls": copy.deepcopy(self.tool_trace),
+            "usage": dict(self.usage),
+            "completed_turns": self.completed_turns,
+        }
+
+
+@dataclass
+class AgentRun:
+    result: dict[str, Any]
+    conversation: AgentConversation
+
+    def as_trace(self) -> dict[str, Any]:
+        trace = self.conversation.as_trace()
+        trace["result"] = copy.deepcopy(self.result)
+        return trace
+
+
 class LLMRoleAgent:
-    def __init__(self, prompt_path: str | Path) -> None:
-        self.prompt = Path(prompt_path).read_text(encoding="utf-8")
+    def __init__(
+        self,
+        role: str,
+        prompt_path: str | Path,
+        registry: ToolRegistry,
+        agent_config: Mapping[str, Any],
+        client_factory: Callable[[], Any] | None = None,
+    ) -> None:
+        self.role = role
+        self.prompt_template = Path(prompt_path).read_text(encoding="utf-8")
+        self.registry = registry
+        self.config = dict(agent_config)
         self.api_key = os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY")
         self.base_url = os.getenv("BASE_URL")
-        self.model = os.getenv("INFER_MODEL", "gpt-5")
+        self.model = os.getenv("INFER_MODEL", str(self.config.get("infer_model", "gpt-5")))
+        self._client_factory = client_factory
+        self._client: Any = None
 
-    def run(self, context: Mapping[str, Any]) -> dict[str, Any]:
+    def _stream_event(self, event: str, payload: Mapping[str, Any]) -> None:
+        if not bool(self.config.get("stream_agent_events", True)):
+            return
+        print(
+            f"\n[Agent:{self.role}] {event}\n"
+            + json.dumps(dict(payload), ensure_ascii=False, indent=2, default=str),
+            flush=True,
+        )
+
+    def _get_client(self) -> Any:
+        if self._client is not None:
+            return self._client
+        if self._client_factory:
+            self._client = self._client_factory()
+            return self._client
         if not self.api_key:
             raise AgentError("API_KEY or OPENAI_API_KEY is required for LLM agent decisions")
         try:
             from openai import OpenAI
         except ImportError as exc:
             raise AgentError("the openai package is required for LLM agent decisions") from exc
-        kwargs: dict[str, Any] = {"api_key": self.api_key, "timeout": 120.0, "max_retries": 2}
+        kwargs: dict[str, Any] = {
+            "api_key": self.api_key,
+            "timeout": float(self.config.get("llm_timeout_seconds", 120.0)),
+            "max_retries": int(self.config.get("llm_max_retries", 2)),
+            "default_headers": {"User-Agent": "curl/7.81.0"},
+        }
         if self.base_url:
             kwargs["base_url"] = self.base_url
-        client = OpenAI(**kwargs)
-        response = client.responses.create(
-            model=self.model,
-            input=[
-                {"role": "system", "content": self.prompt},
-                {"role": "user", "content": json.dumps(context, ensure_ascii=False, default=str)},
+        self._client = OpenAI(**kwargs)
+        return self._client
+
+    def new_conversation(self, context: Mapping[str, Any]) -> AgentConversation:
+        definitions = self.registry.definitions(self.role)
+        prompt = render_prompt(self.prompt_template, context, definitions)
+        return AgentConversation(
+            role=self.role,
+            context=copy.deepcopy(dict(context)),
+            messages=[
+                {"role": "system", "content": prompt},
+                {
+                    "role": "user",
+                    "content": "请分析当前证据。需要更多信息时主动调用工具；证据充分后输出约定的 JSON。",
+                },
             ],
-            max_output_tokens=4096,
         )
-        output_text = getattr(response, "output_text", None)
-        if not output_text:
-            chunks = []
-            for item in getattr(response, "output", []):
-                for content in getattr(item, "content", []):
-                    text = getattr(content, "text", None)
-                    if text:
-                        chunks.append(text)
-            output_text = "\n".join(chunks)
-        return _extract_json(output_text or "")
+
+    @staticmethod
+    def _record_usage(conversation: AgentConversation, response: Any) -> None:
+        usage = _field(response, "usage")
+        conversation.usage["api_calls"] += 1
+        for name in ("input_tokens", "output_tokens", "total_tokens"):
+            value = _field(usage, name, 0) if usage else 0
+            conversation.usage[name] += int(value or 0)
+
+    def run(
+        self,
+        context: Mapping[str, Any] | None = None,
+        conversation: AgentConversation | None = None,
+    ) -> AgentRun:
+        if conversation is None:
+            if context is None:
+                raise AgentError("a new agent run requires context")
+            conversation = self.new_conversation(context)
+        elif conversation.role != self.role:
+            raise AgentError(f"cannot use {conversation.role} conversation with {self.role} agent")
+
+        client = self._get_client()
+        runtime = self.registry.runtime(conversation.context)
+        schemas = self.registry.api_schemas(self.role)
+        max_tool_rounds = max(0, int(self.config.get("max_tool_rounds", 6)))
+        max_output_tokens = int(self.config.get("llm_max_output_tokens", 4096))
+
+        for tool_round in range(max_tool_rounds + 1):
+            request: dict[str, Any] = {
+                "model": self.model,
+                "messages": conversation.messages,
+                "max_tokens": max_output_tokens,
+            }
+            if schemas and tool_round < max_tool_rounds:
+                request["tools"] = schemas
+                request["tool_choice"] = "auto"
+            response = client.chat.completions.create(**request)
+            self._record_usage(conversation, response)
+            calls = _tool_calls(response)
+            if calls:
+                if tool_round >= max_tool_rounds:
+                    raise AgentError(f"{self.role} exceeded max_tool_rounds={max_tool_rounds}")
+                summary = ["I need to call the following tools:"]
+                for call in calls:
+                    summary.append(f"- {_field(call, 'name')}: {_field(call, 'arguments', '{}')}")
+                conversation.messages.append({"role": "assistant", "content": "\n".join(summary)})
+                for call in calls:
+                    name = str(_field(call, "name", ""))
+                    raw_arguments = _field(call, "arguments", "{}")
+                    self._stream_event(
+                        "tool_call",
+                        {"name": name, "arguments": raw_arguments},
+                    )
+                    try:
+                        arguments = raw_arguments if isinstance(raw_arguments, Mapping) else json.loads(raw_arguments or "{}")
+                        result = self.registry.execute(self.role, name, arguments, runtime)
+                        trace = {
+                            "tool_round": tool_round + 1,
+                            "name": name,
+                            "arguments": copy.deepcopy(dict(arguments)),
+                            "status": "success",
+                            "result": copy.deepcopy(result),
+                        }
+                    except (AgentError, ValueError, TypeError, json.JSONDecodeError, RuntimeError) as exc:
+                        result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                        trace = {
+                            "tool_round": tool_round + 1,
+                            "name": name,
+                            "arguments": raw_arguments,
+                            "status": "error",
+                            "result": result,
+                        }
+                    conversation.tool_trace.append(trace)
+                    self._stream_event(
+                        "tool_result",
+                        {
+                            "name": name,
+                            "status": trace["status"],
+                            "error": result.get("error") if isinstance(result, Mapping) else None,
+                        },
+                    )
+                    conversation.messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"The result of tool `{name}` is:\n```json\n"
+                                + json.dumps(result, ensure_ascii=False, default=str)
+                                + "\n```"
+                            ),
+                        }
+                    )
+                continue
+
+            output_text = _response_text(response)
+            result = _extract_json(output_text)
+            self._stream_event("answer", result)
+            conversation.messages.append({"role": "assistant", "content": output_text})
+            conversation.completed_turns += 1
+            return AgentRun(result, conversation)
+        raise AgentError(f"{self.role} did not produce a final response")
 
 
 class AgentSet:
-    def __init__(self, root: str | Path, mode: str = "llm") -> None:
-        prompt_root = Path(root) / "prompts"
+    def __init__(
+        self,
+        root: str | Path,
+        mode: str = "llm",
+        agent_config: Mapping[str, Any] | None = None,
+        history_path: str | Path | None = None,
+    ) -> None:
+        self.root = Path(root).resolve()
+        prompt_root = self.root / "prompts"
         self.mode = mode
-        self.proposal = LLMRoleAgent(prompt_root / "proposal.md")
-        self.feasibility = LLMRoleAgent(prompt_root / "feasibility.md")
-        self.diagnosis = LLMRoleAgent(prompt_root / "diagnosis.md")
+        self.config = dict(agent_config or {})
+        default_history = self.root / str(self.config.get("output_dir", "output")) / "trials.jsonl"
+        self.history_path = Path(history_path).resolve() if history_path else default_history.resolve()
+        self.registry = ToolRegistry(self.root, self.config, self.history_path)
+        self.proposal = LLMRoleAgent("proposal", prompt_root / "proposal.md", self.registry, self.config)
+        self.feasibility = LLMRoleAgent("feasibility", prompt_root / "feasibility.md", self.registry, self.config)
+        self.diagnosis = LLMRoleAgent("diagnosis", prompt_root / "diagnosis.md", self.registry, self.config)
+        self.train_health = LLMRoleAgent(
+            "train_health", prompt_root / "train_health.md", self.registry, self.config
+        )
 
-    def propose(self, context: Mapping[str, Any]) -> dict[str, Any]:
-        if self.mode == "rules":
-            return {"decision": "keep", "reason": "rules mode keeps the current configuration", "changes": {}}
-        return self.proposal.run(context)
+    @staticmethod
+    def _rules_run(role: str, context: Mapping[str, Any], result: dict[str, Any]) -> AgentRun:
+        conversation = AgentConversation(role, copy.deepcopy(dict(context)), [])
+        conversation.completed_turns = 1
+        conversation.messages.append({"role": "assistant", "content": json.dumps(result, ensure_ascii=False)})
+        return AgentRun(result, conversation)
 
-    def review(self, context: Mapping[str, Any]) -> dict[str, Any]:
+    def propose(
+        self,
+        context: Mapping[str, Any] | None = None,
+        conversation: AgentConversation | None = None,
+    ) -> AgentRun:
         if self.mode == "rules":
-            return {"verdict": "valid", "reason": "deterministic validation passed", "risks": []}
+            rule_context = context or (conversation.context if conversation else {})
+            return self._rules_run(
+                "proposal",
+                rule_context,
+                {"decision": "keep", "reason": "rules mode keeps the current configuration", "changes": {}},
+            )
+        return self.proposal.run(context, conversation)
+
+    def review(self, context: Mapping[str, Any]) -> AgentRun:
+        if self.mode == "rules":
+            return self._rules_run(
+                "feasibility",
+                context,
+                {"verdict": "valid", "reason": "deterministic validation passed", "risks": []},
+            )
         return self.feasibility.run(context)
 
-    def diagnose(self, context: Mapping[str, Any]) -> dict[str, Any]:
+    def diagnose(self, context: Mapping[str, Any]) -> AgentRun:
         if self.mode == "rules":
             error_type = context.get("trial", {}).get("error", {}).get("type") or "UNKNOWN_FAILURE"
-            return {
-                "failure_type": error_type,
-                "training_substage": context.get("trial", {}).get("failure_phase")
-                or context.get("trial", {}).get("resource", {}).get("memory_bottleneck")
-                or "unknown",
-                "evidence": context.get("trial", {}).get("error", {}).get("evidence", []),
-                "reason": "deterministic log classification",
-                "confidence": 1.0 if error_type != "UNKNOWN_FAILURE" else 0.3,
-            }
+            return self._rules_run(
+                "diagnosis",
+                context,
+                {
+                    "failure_type": error_type,
+                    "training_substage": context.get("trial", {}).get("failure_phase")
+                    or context.get("trial", {}).get("resource", {}).get("memory_bottleneck")
+                    or "unknown",
+                    "evidence": context.get("trial", {}).get("error", {}).get("evidence", []),
+                    "reason": "deterministic log classification",
+                    "confidence": 1.0 if error_type != "UNKNOWN_FAILURE" else 0.3,
+                },
+            )
         return self.diagnosis.run(context)
+
+    def assess_health(self, context: Mapping[str, Any]) -> AgentRun:
+        if self.mode == "rules":
+            rules = context.get("health_event", {}).get("rules", [])
+            names = [str(row.get("name")) for row in rules if isinstance(row, Mapping)]
+            return self._rules_run(
+                "train_health",
+                context,
+                {
+                    "verdict": "unhealthy",
+                    "action": "stop",
+                    "confidence": 1.0,
+                    "reason_codes": names or ["JF_HPO_RULE_TRIGGERED"],
+                    "evidence": ["JF-HPO deterministic early-stop condition was satisfied"],
+                    "counterevidence": [],
+                    "observe_for_updates": 0,
+                    "reason": "rules mode accepts the configured JF-HPO trigger",
+                },
+            )
+
+        run = self.train_health.run(context)
+        result = run.result
+        verdicts = {"healthy", "watch", "unhealthy", "insufficient_evidence"}
+        actions = {"continue", "observe", "stop"}
+        verdict = result.get("verdict")
+        action = result.get("action")
+        confidence = result.get("confidence")
+        if verdict not in verdicts:
+            raise AgentError(f"train_health returned invalid verdict: {verdict!r}")
+        if action not in actions:
+            raise AgentError(f"train_health returned invalid action: {action!r}")
+        if not isinstance(confidence, (int, float)) or not 0.0 <= float(confidence) <= 1.0:
+            raise AgentError("train_health confidence must be between 0 and 1")
+        if action == "stop" and verdict != "unhealthy":
+            raise AgentError("train_health may recommend stop only with verdict=unhealthy")
+        observe = result.get("observe_for_updates", 0)
+        if not isinstance(observe, int) or observe < 0:
+            raise AgentError("train_health observe_for_updates must be a non-negative integer")
+        return run

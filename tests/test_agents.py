@@ -1,0 +1,153 @@
+from __future__ import annotations
+
+import copy
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+from agent_tools import ToolRegistry
+from agents import AgentSet, LLMRoleAgent
+from config_utils import load_json
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class FakeResponses:
+    def __init__(self, responses: list[object]) -> None:
+        self.responses = list(responses)
+        self.requests: list[dict] = []
+
+    def create(self, **kwargs: object) -> object:
+        self.requests.append(copy.deepcopy(kwargs))
+        return self.responses.pop(0)
+
+
+class FakeClient:
+    def __init__(self, responses: list[object]) -> None:
+        self.responses = FakeResponses(responses)
+        self.chat = SimpleNamespace(completions=self.responses)
+
+
+def response_with_tool(name: str, arguments: str) -> object:
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[
+                        SimpleNamespace(
+                            function=SimpleNamespace(name=name, arguments=arguments)
+                        )
+                    ],
+                )
+            )
+        ],
+        usage=SimpleNamespace(input_tokens=10, output_tokens=3, total_tokens=13),
+    )
+
+
+def response_with_json(text: str) -> object:
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content=text, tool_calls=[])
+            )
+        ],
+        usage=SimpleNamespace(input_tokens=12, output_tokens=5, total_tokens=17),
+    )
+
+
+class LLMRoleAgentTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        config = load_json(ROOT / "config" / "agent_config.json")
+        self.registry = ToolRegistry(ROOT, config, Path(self.temp_dir.name) / "trials.jsonl")
+        self.config = {**config, "max_tool_rounds": 3, "stream_agent_events": False}
+        self.context = {
+            "current_stage": "hardware_tuning",
+            "mode": "hardware_tuning",
+            "current_parameters": load_json(ROOT / "config" / "base_parameters.json"),
+            "editable_parameters": ["actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu"],
+            "constraints": {"max_parameter_changes": 3},
+            "recent_trials": [],
+        }
+
+    def test_tool_result_is_added_before_final_decision(self) -> None:
+        fake = FakeClient(
+            [
+                response_with_tool(
+                    "parameter_understanding",
+                    '{"items":["actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu"]}',
+                ),
+                response_with_json(
+                    '{"decision":"modify","reference_trial_id":1,"reason":"tested","changes":{"actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu":{"from":1,"to":2,"reason":"increase throughput"}},"expected_effect":{"throughput":"increase"}}'
+                ),
+            ]
+        )
+        agent = LLMRoleAgent(
+            "proposal",
+            ROOT / "prompts" / "proposal.md",
+            self.registry,
+            self.config,
+            client_factory=lambda: fake,
+        )
+        run = agent.run(self.context)
+        self.assertEqual(run.result["decision"], "modify")
+        self.assertEqual(run.conversation.tool_trace[0]["status"], "success")
+        self.assertEqual(len(fake.responses.requests), 2)
+        second_messages = fake.responses.requests[1]["messages"]
+        self.assertTrue(any("result of tool" in message["content"] for message in second_messages))
+
+    def test_rejection_continues_the_same_conversation(self) -> None:
+        fake = FakeClient(
+            [
+                response_with_json('{"decision":"modify","reference_trial_id":1,"reason":"first","changes":{"x":{"from":0,"to":1,"reason":"first attempt"}}}'),
+                response_with_json('{"decision":"modify","reference_trial_id":1,"reason":"second","changes":{"x":{"from":0,"to":2,"reason":"second attempt"}}}'),
+            ]
+        )
+        agent = LLMRoleAgent(
+            "proposal",
+            ROOT / "prompts" / "proposal.md",
+            self.registry,
+            self.config,
+            client_factory=lambda: fake,
+        )
+        first = agent.run(self.context)
+        first.conversation.add_user_message("## 第 1 次建议被拒绝\nValidator says x=1 is invalid")
+        second = agent.run(conversation=first.conversation)
+        self.assertEqual(second.result["changes"]["x"]["to"], 2)
+        self.assertEqual(second.conversation.completed_turns, 2)
+        request_messages = fake.responses.requests[1]["messages"]
+        self.assertTrue(any("第 1 次建议被拒绝" in message["content"] for message in request_messages))
+        self.assertTrue(any('"reason":"first"' in message["content"] for message in request_messages))
+
+
+class TrainHealthRulesAgentTest(unittest.TestCase):
+    def test_rules_mode_accepts_jf_hpo_trigger(self) -> None:
+        config = load_json(ROOT / "config" / "agent_config.json")
+        config["stream_agent_events"] = False
+        with tempfile.TemporaryDirectory() as directory:
+            agents = AgentSet(
+                ROOT,
+                "rules",
+                config,
+                Path(directory) / "trials.jsonl",
+            )
+            run = agents.assess_health(
+                {
+                    "current_stage": "stability_tuning",
+                    "health_event": {
+                        "rules": [{"name": "jf_hpo_kl_growth"}],
+                    },
+                    "recent_trials": [],
+                }
+            )
+        self.assertEqual(run.result["verdict"], "unhealthy")
+        self.assertEqual(run.result["action"], "stop")
+
+
+if __name__ == "__main__":
+    unittest.main()
