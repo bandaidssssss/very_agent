@@ -267,7 +267,7 @@ def build_command(
             "trainer.total_training_steps": updates,
             "trainer.total_epochs": max(1, int(parameters.get("trainer.total_epochs", 1))),
             "trainer.experiment_name": f"verl_agent_trial_{trial_id:04d}",
-            "trainer.logger": ["console"],
+            "trainer.logger": parameters.get("trainer.logger", ["console"]),
             "trainer.save_freq": save_freq,
             "trainer.test_freq": -1,
             "trainer.val_before_train": False,

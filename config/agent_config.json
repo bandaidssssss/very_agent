@@ -32,7 +32,7 @@
   "resource_memory_limit_pct": 95.0,
   "throughput_memory_limit_pct": 92.0,
   "warmup_updates": 5,
-  "max_validation_rounds": 3,
+  "max_validation_rounds": 6,
   "max_tool_rounds": 6,
   "max_response_repair_rounds": 2,
   "tool_timeout_seconds": 5.0,
