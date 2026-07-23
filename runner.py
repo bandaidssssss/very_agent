@@ -30,6 +30,11 @@ PHASE_START = {
     "Before update_actor": "training",
 }
 PHASE_END = tuple(value.replace("Before", "After", 1) for value in PHASE_START)
+# MetaX C550's verl build does not emit ``Before generate_sequences``.  Instead,
+# it reports that rollout has been initialized once, then emits
+# ``After update_actor`` immediately before each following rollout.  Keep the
+# sampler in rollout until the next explicit compute phase begins.
+C550_ROLLOUT_START = ("After rollout init", "After update_actor")
 
 
 class PhaseTracker:
@@ -43,6 +48,9 @@ class PhaseTracker:
                 if marker in line:
                     self._phase = phase
                     return
+            if any(marker in line for marker in C550_ROLLOUT_START):
+                self._phase = "rollout"
+                return
             if any(marker in line for marker in PHASE_END):
                 self._phase = "between_phases"
 

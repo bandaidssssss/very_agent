@@ -13,7 +13,7 @@ NUMBER = r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?"
 PAIR_RE = re.compile(rf"([^\s:]+):({NUMBER})")
 STEP_RE = re.compile(r"step:(\d+)")
 MEMORY_RE = re.compile(
-    rf"(?P<when>Before|After) (?P<name>generate_sequences|compute_log_prob|compute_ref_log_prob|update_actor),.*?"
+    rf"(?P<when>Before|After) (?P<name>generate_sequences|compute_log_prob|compute_ref_log_prob|update_actor|rollout offload),.*?"
     rf"device memory used/total \(GB\): (?P<used>{NUMBER})/(?P<total>{NUMBER})"
 )
 FATAL_PATTERNS = {
@@ -28,6 +28,8 @@ FATAL_PATTERNS = {
 }
 PHASE_NAMES = {
     "generate_sequences": "rollout",
+    # C550 / MetaX verl logs report the rollout boundary as an offload event.
+    "rollout offload": "rollout",
     "compute_log_prob": "actor_log_prob",
     "compute_ref_log_prob": "ref_log_prob",
     "update_actor": "training",

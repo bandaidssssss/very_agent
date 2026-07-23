@@ -36,6 +36,18 @@ step:2 - critic/rewards/mean:0.2 - actor/ppo_kl:0.02 - actor/entropy:0.2 - actor
         self.assertEqual(result["0.0"]["step"], 2)
         self.assertEqual(result["0.1"]["cumulative_tokens"], 30)
 
+    def test_parses_c550_rollout_offload_memory(self) -> None:
+        text = """
+Before rollout offload, memory allocated (GB): 27.68, memory reserved (GB): 33.73, device memory used/total (GB): 38.42/63.59
+After rollout offload, memory allocated (GB): 27.68, memory reserved (GB): 27.78, device memory used/total (GB): 6.91/63.59
+step:1 - critic/rewards/mean:0.1 - perf/time_per_step:2 - perf/total_num_tokens:10
+""".strip()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "train.log"
+            path.write_text(text, encoding="utf-8")
+            report = analyze_trial(path, None, warmup_updates=0)
+        self.assertAlmostEqual(report["memory_by_phase_pct"]["rollout"]["max"], 100.0 * 38.42 / 63.59)
+
     def test_normal_nccl_configuration_is_not_failure(self) -> None:
         text = """
 ray init kwargs: {'env_vars': {'NCCL_CUMEM_ENABLE': '0'}}
