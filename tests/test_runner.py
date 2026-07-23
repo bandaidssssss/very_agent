@@ -12,6 +12,17 @@ from runner import GPUSampler, HealthAgentWorker, PhaseTracker
 
 
 class GPUSamplerTest(unittest.TestCase):
+    def test_phase_tracker_recognizes_c550_rollout_boundaries(self) -> None:
+        tracker = PhaseTracker()
+        tracker.update_from_log("DEBUG:After rollout init, device memory used/total (GB): 5.26/63.59")
+        self.assertEqual(tracker.get(), "rollout")
+
+        tracker.update_from_log("DEBUG:compute_log_prob Before compute_log_prob")
+        self.assertEqual(tracker.get(), "actor_log_prob")
+
+        tracker.update_from_log("DEBUG:update_actor After update_actor")
+        self.assertEqual(tracker.get(), "rollout")
+
     def test_nvidia_csv_query(self) -> None:
         response = subprocess.CompletedProcess([], 0, "0, 1024, 8192, 75\n", "")
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
