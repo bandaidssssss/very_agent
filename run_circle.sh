@@ -7,6 +7,8 @@ export MAX_TRIALS=${MAX_TRIALS:-1}
 RUN_TIME=$(date +%m%d_%H%M_%Y)
 export OUTPUT_PATH=${OUTPUT_PATH:-${SCRIPT_DIR}/output}/${RUN_TIME}
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}"
+mkdir -p "${OUTPUT_PATH}"
+RUN_LOG="${OUTPUT_PATH}/run_circle.log"
 
 if [[ -z "${VERL_ENV_SCRIPT:-}" ]]; then
     PLATFORM_UPPER=$(printf '%s' "${PLATFORM}" | tr '[:lower:]' '[:upper:]')
@@ -18,8 +20,8 @@ if [[ -z "${VERL_ENV_SCRIPT:-}" ]]; then
     esac
 fi
 
-exec python3 "${SCRIPT_DIR}/run_agent.py" \
+python3 "${SCRIPT_DIR}/run_agent.py" \
     --base-config "${BASE_CONFIG_FILE:-${SCRIPT_DIR}/config/base_parameters.json}" \
     --agent-config "${AGENT_CONFIG_FILE:-${SCRIPT_DIR}/config/agent_config.json}" \
     --max-trials "${MAX_TRIALS}" \
-    "$@"
+    "$@" 2>&1 | tee -a "${RUN_LOG}"
