@@ -67,6 +67,10 @@ PLATFORM=C550 MAX_TRIALS=1 bash run_circle.sh
 PLATFORM=C550 MAX_TRIALS=10 bash run_circle.sh
 ```
 
+每次运行的终端标准输出和标准错误也会保存到本次实验目录的
+`run_circle.log`；训练子进程的逐 trial 日志仍保存在
+`trials/NNNN/train.log`。
+
 默认一次只运行一个 trial，便于检查实际 GPU 环境。确认配置和监控正确后再提高 `--max-trials`。
 
 Proposal 会显式记录候选继承自哪个 trial，并逐项输出参数的 `from → to`、修改原因和预期指标变化。orchestrator 会核对 reference trial 与旧值，再提取 `target_changes` 交给 Validator、显存估算和 Feasibility；参考实验或旧值不一致的建议会被确定性拒绝。
