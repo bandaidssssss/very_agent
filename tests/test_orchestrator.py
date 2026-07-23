@@ -5,7 +5,7 @@ import json
 import tempfile
 from pathlib import Path
 
-from agents import AgentConversation, AgentRun
+from agents import AgentConversation, AgentResponseError, AgentRun
 from config_utils import load_json
 from orchestrator import TuningOrchestrator, _normalize_proposal_changes, determine_stage
 
@@ -168,7 +168,9 @@ class RejectionConversationTest(unittest.TestCase):
                         conversation = AgentConversation("proposal", dict(context), [{"role": "user", "content": "start"}])
                     else:
                         assert any("第 1 次建议被拒绝" in row["content"] for row in conversation.messages)
-                    value = 3 if self.calls == 1 else 2
+                    value = 3 if self.calls == 1 else (
+                        base["actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu"] * 2
+                    )
                     result = {
                         "decision": "modify",
                         "reference_trial_id": 1,
@@ -209,7 +211,10 @@ class RejectionConversationTest(unittest.TestCase):
             candidate, proposal, review, trace = orchestrator._propose_candidate(
                 "hardware_tuning", base, trials
             )
-            self.assertEqual(candidate["actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu"], 2)
+            self.assertEqual(
+                candidate["actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu"],
+                base["actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu"] * 2,
+            )
             self.assertEqual(fake.calls, 2)
             self.assertEqual(proposal["reason"], "attempt 2")
             self.assertEqual(review["verdict"], "valid")
@@ -274,6 +279,56 @@ class RejectionConversationTest(unittest.TestCase):
             self.assertEqual(review["verdict"], "blocked")
             self.assertEqual(len(trace["rejections"]), 2)
             self.assertTrue((Path(temp_dir) / "last_agent_rejection.json").exists())
+
+    def test_exhausted_response_repairs_write_blocked_state(self) -> None:
+        base = load_json(ROOT / "config" / "base_parameters.json")
+        config = load_json(ROOT / "config" / "agent_config.json")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config.update(
+                {
+                    "output_dir": temp_dir,
+                    "stream_agent_events": False,
+                }
+            )
+            orchestrator = TuningOrchestrator(ROOT, base, config)
+            trials = [
+                {
+                    "trial_id": 1,
+                    "stage": "hardware_tuning",
+                    "result": "success",
+                    "parameters": base,
+                    "performance": {"throughput": {"mean": 1.0}},
+                }
+            ]
+            orchestrator.trials = lambda: trials
+
+            class InvalidResponseAgents:
+                def propose(self, context=None, conversation=None):
+                    active = conversation or AgentConversation(
+                        "proposal",
+                        dict(context),
+                        [{"role": "assistant", "content": "not json"}],
+                    )
+                    raise AgentResponseError(
+                        "proposal",
+                        "proposal response repair exhausted",
+                        "not json",
+                        2,
+                        active,
+                    )
+
+                def diagnose(self, context):
+                    raise AssertionError("successful previous trial should not be diagnosed")
+
+            orchestrator.agents = InvalidResponseAgents()
+
+            reports = orchestrator.run(max_trials=1)
+
+            self.assertEqual(reports, [])
+            state = load_json(Path(temp_dir) / "state.json")
+            self.assertEqual(state["current_stage"], "agent_response_blocked")
+            self.assertEqual(state["agent_role"], "proposal")
+            self.assertTrue((Path(temp_dir) / "last_agent_error.json").exists())
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any, Mapping
 
-from agents import AgentSet
+from agents import AgentResponseError, AgentSet
 from config_utils import append_jsonl, apply_changes, read_jsonl, write_json
 from prompting import rejection_feedback
 from runner import run_trial
@@ -559,9 +559,33 @@ class TuningOrchestrator:
             first_hardware = not _hardware_trials(trials)
             first_stability = stage == "stability_tuning" and not _stability_trials(trials)
             if not first_hardware and not first_stability and stage != "confirm":
-                parameters, proposal, review, agent_trace = self._propose_candidate(
-                    stage, parameters, trials, reference
-                )
+                try:
+                    parameters, proposal, review, agent_trace = self._propose_candidate(
+                        stage, parameters, trials, reference
+                    )
+                except AgentResponseError as exc:
+                    error_path = self.output_dir / "last_agent_error.json"
+                    error_record = {
+                        "stage": stage,
+                        "reference_trial_id": reference.get("trial_id"),
+                        **exc.as_dict(),
+                    }
+                    write_json(error_path, error_record)
+                    blocked = {
+                        "current_stage": "agent_response_blocked",
+                        "resume_stage": stage,
+                        "last_trial_id": len(trials),
+                        "history_path": str(self.history_path),
+                        "reference_trial_id": reference.get("trial_id"),
+                        "agent_role": exc.role,
+                        "reason": exc.reason,
+                        "error_path": str(error_path),
+                    }
+                    write_json(self.state_path, blocked)
+                    _stream_orchestrator_event(
+                        self.config, "agent_response_blocked", blocked
+                    )
+                    break
                 if proposal.get("decision") == "blocked":
                     write_json(
                         self.state_path,

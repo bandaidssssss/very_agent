@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from agent_tools import ToolRegistry
-from agents import AgentSet, LLMRoleAgent
+from agents import AgentResponseError, AgentSet, LLMRoleAgent
 from config_utils import load_json
 
 
@@ -100,6 +100,9 @@ class LLMRoleAgentTest(unittest.TestCase):
         self.assertEqual(len(fake.responses.requests), 2)
         second_messages = fake.responses.requests[1]["messages"]
         self.assertTrue(any("result of tool" in message["content"] for message in second_messages))
+        self.assertEqual(
+            fake.responses.requests[0]["response_format"], {"type": "json_object"}
+        )
 
     def test_rejection_continues_the_same_conversation(self) -> None:
         fake = FakeClient(
@@ -123,6 +126,61 @@ class LLMRoleAgentTest(unittest.TestCase):
         request_messages = fake.responses.requests[1]["messages"]
         self.assertTrue(any("第 1 次建议被拒绝" in message["content"] for message in request_messages))
         self.assertTrue(any('"reason":"first"' in message["content"] for message in request_messages))
+
+    def test_invalid_json_is_repaired_in_the_same_conversation(self) -> None:
+        fake = FakeClient(
+            [
+                response_with_json(
+                    '{"decision":"keep"}\n{"decision":"stop"}'
+                ),
+                response_with_json(
+                    '{"decision":"keep","reason":"corrected","changes":{}}'
+                ),
+            ]
+        )
+        agent = LLMRoleAgent(
+            "proposal",
+            ROOT / "prompts" / "proposal.md",
+            self.registry,
+            self.config,
+            client_factory=lambda: fake,
+        )
+
+        run = agent.run(self.context)
+
+        self.assertEqual(run.result["reason"], "corrected")
+        self.assertEqual(len(fake.responses.requests), 2)
+        repair_messages = fake.responses.requests[1]["messages"]
+        self.assertTrue(
+            any("无法作为最终 JSON 解析" in message["content"] for message in repair_messages)
+        )
+        self.assertNotIn("tools", fake.responses.requests[1])
+
+    def test_invalid_json_exhaustion_raises_typed_response_error(self) -> None:
+        fake = FakeClient(
+            [
+                response_with_json("not json"),
+                response_with_json("still not json"),
+                response_with_json("also not json"),
+            ]
+        )
+        agent = LLMRoleAgent(
+            "proposal",
+            ROOT / "prompts" / "proposal.md",
+            self.registry,
+            self.config,
+            client_factory=lambda: fake,
+        )
+
+        with self.assertRaises(AgentResponseError) as raised:
+            agent.run(self.context)
+
+        self.assertEqual(raised.exception.role, "proposal")
+        self.assertEqual(raised.exception.repair_attempts, 2)
+        self.assertEqual(len(fake.responses.requests), 3)
+        self.assertEqual(
+            raised.exception.trace["messages"][-1]["content"], "also not json"
+        )
 
 
 class TrainHealthRulesAgentTest(unittest.TestCase):

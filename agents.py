@@ -16,6 +16,35 @@ class AgentError(RuntimeError):
     pass
 
 
+class AgentResponseError(AgentError):
+    """Raised after an agent repeatedly returns an unusable final response."""
+
+    def __init__(
+        self,
+        role: str,
+        reason: str,
+        raw_response: str,
+        repair_attempts: int,
+        conversation: AgentConversation,
+    ) -> None:
+        super().__init__(reason)
+        self.role = role
+        self.reason = reason
+        self.raw_response = raw_response
+        self.repair_attempts = repair_attempts
+        self.trace = conversation.as_trace()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "agent_role": self.role,
+            "error_type": "invalid_agent_response",
+            "reason": self.reason,
+            "repair_attempts": self.repair_attempts,
+            "raw_response": self.raw_response,
+            "agent_trace": copy.deepcopy(self.trace),
+        }
+
+
 def _extract_json(text: str) -> dict[str, Any]:
     stripped = text.strip()
     fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, re.S)
@@ -185,15 +214,23 @@ class LLMRoleAgent:
         runtime = self.registry.runtime(conversation.context)
         schemas = self.registry.api_schemas(self.role)
         max_tool_rounds = max(0, int(self.config.get("max_tool_rounds", 6)))
+        max_response_repairs = max(0, int(self.config.get("max_response_repair_rounds", 2)))
         max_output_tokens = int(self.config.get("llm_max_output_tokens", 4096))
+        enable_json_response_format = bool(
+            self.config.get("enable_json_response_format", False)
+        )
+        tool_round = 0
+        response_repairs = 0
 
-        for tool_round in range(max_tool_rounds + 1):
+        while True:
             request: dict[str, Any] = {
                 "model": self.model,
                 "messages": conversation.messages,
                 "max_tokens": max_output_tokens,
             }
-            if schemas and tool_round < max_tool_rounds:
+            if enable_json_response_format:
+                request["response_format"] = {"type": "json_object"}
+            if schemas and tool_round < max_tool_rounds and response_repairs == 0:
                 request["tools"] = schemas
                 request["tool_choice"] = "auto"
             response = client.chat.completions.create(**request)
@@ -251,15 +288,52 @@ class LLMRoleAgent:
                             ),
                         }
                     )
+                tool_round += 1
                 continue
 
             output_text = _response_text(response)
-            result = _extract_json(output_text)
+            finish_reason = _field(response.choices[0], "finish_reason")
+            try:
+                if finish_reason == "length":
+                    raise AgentError(
+                        "agent response was truncated because finish_reason='length'"
+                    )
+                result = _extract_json(output_text)
+            except AgentError as exc:
+                conversation.messages.append(
+                    {"role": "assistant", "content": output_text}
+                )
+                self._stream_event(
+                    "answer_rejected",
+                    {
+                        "reason": str(exc),
+                        "repair_attempt": response_repairs + 1,
+                        "raw_response": output_text,
+                    },
+                )
+                if response_repairs >= max_response_repairs:
+                    raise AgentResponseError(
+                        self.role,
+                        (
+                            f"{self.role} did not return valid JSON after "
+                            f"{response_repairs} repair attempts: {exc}"
+                        ),
+                        output_text,
+                        response_repairs,
+                        conversation,
+                    ) from exc
+                response_repairs += 1
+                conversation.add_user_message(
+                    "上一条回复无法作为最终 JSON 解析。"
+                    f"解析错误：{exc}。"
+                    "请纠正上一条回复，只输出一个完整、有效且符合既定格式的 JSON 对象；"
+                    "不要调用工具，不要输出 Markdown、代码围栏或额外解释。"
+                )
+                continue
             self._stream_event("answer", result)
             conversation.messages.append({"role": "assistant", "content": output_text})
             conversation.completed_turns += 1
             return AgentRun(result, conversation)
-        raise AgentError(f"{self.role} did not produce a final response")
 
 
 class AgentSet:

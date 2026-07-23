@@ -125,7 +125,7 @@ class ToolRegistry:
 
     def _memory_estimator(self, arguments: Mapping[str, Any], runtime: ToolRuntime) -> dict[str, Any]:
         context = runtime.context
-        current = context.get("current_parameters") or context.get("candidate_parameters") or {}
+        current = context.get("current_parameters") or context.get("candidate_parameters") or {} #current_parameters是历史数据最好的
         if not isinstance(current, Mapping):
             raise ToolError("context does not contain current or candidate parameters")
         candidate = dict(context.get("candidate_parameters") or current)
