@@ -26,18 +26,20 @@ class AgentResponseError(AgentError):
         raw_response: str,
         repair_attempts: int,
         conversation: AgentConversation,
+        error_type: str = "invalid_agent_response",
     ) -> None:
         super().__init__(reason)
         self.role = role
         self.reason = reason
         self.raw_response = raw_response
         self.repair_attempts = repair_attempts
+        self.error_type = error_type
         self.trace = conversation.as_trace()
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "agent_role": self.role,
-            "error_type": "invalid_agent_response",
+            "error_type": self.error_type,
             "reason": self.reason,
             "repair_attempts": self.repair_attempts,
             "raw_response": self.raw_response,
@@ -94,6 +96,7 @@ class AgentConversation:
     context: dict[str, Any]
     messages: list[dict[str, Any]]
     tool_trace: list[dict[str, Any]] = field(default_factory=list)
+    request_errors: list[dict[str, Any]] = field(default_factory=list)
     usage: dict[str, int] = field(
         default_factory=lambda: {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "api_calls": 0}
     )
@@ -108,6 +111,7 @@ class AgentConversation:
             "context": copy.deepcopy(self.context),
             "messages": copy.deepcopy(self.messages),
             "tool_calls": copy.deepcopy(self.tool_trace),
+            "request_errors": copy.deepcopy(self.request_errors),
             "usage": dict(self.usage),
             "completed_turns": self.completed_turns,
         }
@@ -167,7 +171,9 @@ class LLMRoleAgent:
         kwargs: dict[str, Any] = {
             "api_key": self.api_key,
             "timeout": float(self.config.get("llm_timeout_seconds", 120.0)),
-            "max_retries": int(self.config.get("llm_max_retries", 2)),
+            # Application-level retries below are authoritative so request
+            # attempts and JSON repairs share one bounded retry policy.
+            "max_retries": 0,
             "default_headers": {"User-Agent": "curl/7.81.0"},
         }
         if self.base_url:
@@ -233,7 +239,32 @@ class LLMRoleAgent:
             if schemas and tool_round < max_tool_rounds and response_repairs == 0:
                 request["tools"] = schemas
                 request["tool_choice"] = "auto"
-            response = client.chat.completions.create(**request)
+            request_retries = 0
+            while True:
+                try:
+                    response = client.chat.completions.create(**request)
+                    break
+                except Exception as exc:
+                    request_error = {
+                        "retry_attempt": request_retries + 1,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                    conversation.request_errors.append(request_error)
+                    self._stream_event("request_rejected", request_error)
+                    if request_retries >= max_response_repairs:
+                        raise AgentResponseError(
+                            self.role,
+                            (
+                                f"{self.role} API request failed after "
+                                f"{request_retries} retry attempts: "
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                            "",
+                            request_retries,
+                            conversation,
+                            error_type="agent_request_failed",
+                        ) from exc
+                    request_retries += 1
             self._record_usage(conversation, response)
             calls = _tool_calls(response)
             if calls:

@@ -259,18 +259,11 @@ def build_command(
 ) -> tuple[list[str], Path]:
     verl_root = Path(os.getenv("VERL_ROOT", str(agent_config["verl_root"]))).expanduser().resolve()
     run_parameters = dict(parameters)
-    save_freq = -1
-    if stage == "stability_tuning":
-        save_freq = int(agent_config.get("stability_checkpoint_freq", 5))
     run_parameters.update(
         {
             "trainer.total_training_steps": updates,
             "trainer.total_epochs": max(1, int(parameters.get("trainer.total_epochs", 1))),
-            "trainer.experiment_name": f"verl_agent_trial_{trial_id:04d}",
             "trainer.logger": parameters.get("trainer.logger", ["console"]),
-            "trainer.save_freq": save_freq,
-            "trainer.test_freq": -1,
-            "trainer.val_before_train": False,
         }
     )
     command = [

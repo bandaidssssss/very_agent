@@ -449,7 +449,7 @@ def run(self, context=None, conversation=None) -> AgentRun:
 kwargs = {
     "api_key": self.api_key,              # API_KEY 或 OPENAI_API_KEY
     "timeout": 120.0,                     # llm_timeout_seconds
-    "max_retries": 2,                     # llm_max_retries
+    "max_retries": 0,                     # 由 Agent 应用层统一执行有限重试
     "default_headers": {"User-Agent": "curl/7.81.0"},  # 模拟 curl
 }
 if self.base_url:
@@ -913,12 +913,9 @@ def _reference_trial(current, trials, reference_trial_id):
 
 ```python
 def build_command(parameters, agent_config, trial_id, updates):
-    # 1. 注入运行时参数
+    # 1. 仅注入 Trial 运行步数；experiment_name、logger、save_freq、
+    #    test_freq、val_before_train 沿用 base/current parameters
     run_parameters["trainer.total_training_steps"] = updates
-    run_parameters["trainer.experiment_name"] = f"verl_agent_trial_{trial_id:04d}"
-    run_parameters["trainer.logger"] = ["console"]    # 只输出到控制台
-    run_parameters["trainer.save_freq"] = -1           # 不保存 checkpoint
-    run_parameters["trainer.test_freq"] = -1           # 不运行验证
 
     # 2. 构建 Hydra 命令行
     command = ["python3", "-m", "verl.trainer.main_ppo",

@@ -8,7 +8,40 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from runner import GPUSampler, HealthAgentWorker, PhaseTracker
+from runner import GPUSampler, HealthAgentWorker, PhaseTracker, build_command
+
+
+class BuildCommandTest(unittest.TestCase):
+    def test_preserves_base_trainer_runtime_fields_in_stability_stage(self) -> None:
+        parameters = {
+            "trainer.total_epochs": 2,
+            "trainer.logger": ["console", "wandb"],
+            "trainer.experiment_name": "base-experiment",
+            "trainer.save_freq": -1,
+            "trainer.test_freq": 7,
+            "trainer.val_before_train": True,
+        }
+        agent_config = {
+            "verl_root": "/tmp/verl",
+            "config_path": "config",
+            "config_name": "ppo_megatron_trainer.yaml",
+            "environment_script": None,
+        }
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            command, _ = build_command(
+                parameters,
+                agent_config,
+                trial_id=3,
+                updates=80,
+                stage="stability_tuning",
+            )
+
+        self.assertIn("trainer.total_training_steps=80", command)
+        self.assertIn("trainer.experiment_name=base-experiment", command)
+        self.assertIn("trainer.save_freq=-1", command)
+        self.assertIn("trainer.test_freq=7", command)
+        self.assertIn("trainer.val_before_train=True", command)
 
 
 class GPUSamplerTest(unittest.TestCase):

@@ -21,7 +21,10 @@ class FakeResponses:
 
     def create(self, **kwargs: object) -> object:
         self.requests.append(copy.deepcopy(kwargs))
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 class FakeClient:
@@ -181,6 +184,53 @@ class LLMRoleAgentTest(unittest.TestCase):
         self.assertEqual(
             raised.exception.trace["messages"][-1]["content"], "also not json"
         )
+
+    def test_api_request_error_is_retried_with_the_json_retry_limit(self) -> None:
+        fake = FakeClient(
+            [
+                RuntimeError("temporary API failure"),
+                response_with_json(
+                    '{"decision":"keep","reason":"request recovered","changes":{}}'
+                ),
+            ]
+        )
+        agent = LLMRoleAgent(
+            "proposal",
+            ROOT / "prompts" / "proposal.md",
+            self.registry,
+            self.config,
+            client_factory=lambda: fake,
+        )
+
+        run = agent.run(self.context)
+
+        self.assertEqual(run.result["reason"], "request recovered")
+        self.assertEqual(len(fake.responses.requests), 2)
+        self.assertEqual(len(run.conversation.request_errors), 1)
+
+    def test_api_request_retry_exhaustion_raises_response_error(self) -> None:
+        fake = FakeClient(
+            [
+                RuntimeError("API failure 1"),
+                RuntimeError("API failure 2"),
+                RuntimeError("API failure 3"),
+            ]
+        )
+        agent = LLMRoleAgent(
+            "proposal",
+            ROOT / "prompts" / "proposal.md",
+            self.registry,
+            self.config,
+            client_factory=lambda: fake,
+        )
+
+        with self.assertRaises(AgentResponseError) as raised:
+            agent.run(self.context)
+
+        self.assertEqual(raised.exception.error_type, "agent_request_failed")
+        self.assertEqual(raised.exception.repair_attempts, 2)
+        self.assertEqual(len(fake.responses.requests), 3)
+        self.assertEqual(len(raised.exception.trace["request_errors"]), 3)
 
 
 class TrainHealthRulesAgentTest(unittest.TestCase):
