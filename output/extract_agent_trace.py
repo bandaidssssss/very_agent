@@ -119,16 +119,166 @@ def extract_proposal_changes(proposal: dict | None) -> str:
     return "\n".join(lines)
 
 
-def extract_feasibility(feas: list[dict] | None) -> str:
-    """格式化 feasibility reviews。"""
+def _feasibility_result(review: dict) -> dict:
+    """兼容新旧 trace：新格式把最终判定放在 review.result 中。"""
+    for key in ("result", "review", "decision"):
+        value = review.get(key)
+        if isinstance(value, dict):
+            return value
+    return review
+
+
+def _feasibility_tool_calls(review: dict) -> list[dict]:
+    """从 feasibility Agent 运行记录中提取工具调用。"""
+    tool_calls = review.get("tool_calls")
+    if isinstance(tool_calls, list):
+        return tool_calls
+
+    # 兼容曾经把 Agent 运行信息包在 conversation/trace 中的格式。
+    for key in ("conversation", "trace"):
+        nested = review.get(key)
+        if isinstance(nested, dict) and isinstance(nested.get("tool_calls"), list):
+            return nested["tool_calls"]
+    return []
+
+
+def extract_feasibility(feas: list[dict] | dict | None) -> str:
+    """格式化 feasibility Agent 的工具调用、判定、风险和显存预测。"""
     if not feas:
         return ""
-    lines = ["### Feasibility 审查", ""]
-    for i, f in enumerate(feas):
-        verdict = f.get("verdict", "?")
-        reason = f.get("reason", "")
-        lines.append(f"- **#{i+1} 判定**: `{verdict}` — {reason}")
+    if isinstance(feas, dict):
+        feas = [feas]
+
+    lines = ["#### Feasibility Agent 审查", ""]
+    for i, review in enumerate(feas):
+        if not isinstance(review, dict):
+            continue
+
+        result = _feasibility_result(review)
+        tool_calls = _feasibility_tool_calls(review)
+        verdict = result.get("verdict", "?")
+        reason = result.get("reason", "")
+        attempt = review.get("attempt", i + 1)
+
+        lines.append(f"**审查 #{i + 1}（attempt={attempt}）**")
+        lines.append("")
+        if tool_calls:
+            lines.append(f"**Feasibility 工具调用 ({len(tool_calls)} 次):**")
+            lines.append("")
+            lines.append(extract_tool_calls(tool_calls))
+        else:
+            lines.append("_Feasibility Agent 无工具调用_")
+            lines.append("")
+
+        lines.append(f"- **判定**: `{verdict}`")
+        lines.append(f"- **原因**: {reason or '-'}")
+
+        risks = result.get("risks", [])
+        if risks:
+            lines.append("- **风险**:")
+            for risk in risks:
+                lines.append(f"  - {risk}")
+
+        predicted = result.get("predicted_memory_pct")
+        if isinstance(predicted, dict) and predicted:
+            lines.append("")
+            lines.append("**预测显存占用 (%):**")
+            lines.append("")
+            lines.append("| rollout | actor_log_prob | ref_log_prob | training |")
+            lines.append("|---:|---:|---:|---:|")
+            lines.append(
+                "| "
+                + " | ".join(
+                    _fmt(predicted.get(phase), ".2f")
+                    for phase in (
+                        "rollout",
+                        "actor_log_prob",
+                        "ref_log_prob",
+                        "training",
+                    )
+                )
+                + " |"
+            )
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def extract_diagnosis(diagnosis: dict | None) -> str:
+    """格式化 Diagnosis Agent 的工具调用和最终诊断。"""
+    if not isinstance(diagnosis, dict):
+        return ""
+
+    result = _feasibility_result(diagnosis)
+    tool_calls = _feasibility_tool_calls(diagnosis)
+    lines = ["#### Diagnosis Agent 诊断", ""]
+
+    if tool_calls:
+        lines.append(f"**Diagnosis 工具调用 ({len(tool_calls)} 次):**")
+        lines.append("")
+        lines.append(extract_tool_calls(tool_calls))
+    else:
+        lines.append("_Diagnosis Agent 无工具调用_")
+        lines.append("")
+
+    lines.append(f"- **失败类型**: `{result.get('failure_type', '?')}`")
+    lines.append(f"- **训练子阶段**: `{result.get('training_substage', '?')}`")
+    if result.get("confidence") is not None:
+        lines.append(f"- **置信度**: {result['confidence']}")
+    lines.append(f"- **原因**: {result.get('reason') or '-'}")
+
+    evidence = result.get("evidence", [])
+    if evidence:
+        lines.append("- **证据**:")
+        for item in evidence:
+            lines.append(f"  - {item}")
     lines.append("")
+    return "\n".join(lines)
+
+
+def extract_health_decisions(decisions: list[dict] | None) -> str:
+    """格式化 Trial 运行期间 Health Monitor 的决策。"""
+    if not decisions:
+        return ""
+
+    lines = ["### Trial 运行中的 Health Monitor 行为", ""]
+    for index, decision in enumerate(decisions):
+        if not isinstance(decision, dict):
+            continue
+
+        event_id = decision.get("event_id", f"event-{index + 1}")
+        lines.append(f"#### Health 决策 #{index + 1}: `{event_id}`")
+        lines.append("")
+        lines.append(f"- **判定**: `{decision.get('verdict', '?')}`")
+        lines.append(f"- **动作**: `{decision.get('action', '?')}`")
+        if decision.get("confidence") is not None:
+            lines.append(f"- **置信度**: {decision['confidence']}")
+        if decision.get("observe_for_updates") is not None:
+            lines.append(
+                f"- **继续观察步数**: {decision['observe_for_updates']}"
+            )
+        lines.append(f"- **原因**: {decision.get('reason') or '-'}")
+
+        reason_codes = decision.get("reason_codes", [])
+        if reason_codes:
+            lines.append(
+                "- **原因代码**: "
+                + ", ".join(f"`{code}`" for code in reason_codes)
+            )
+
+        evidence = decision.get("evidence", [])
+        if evidence:
+            lines.append("- **支持证据**:")
+            for item in evidence:
+                lines.append(f"  - {item}")
+
+        counterevidence = decision.get("counterevidence", [])
+        if counterevidence:
+            lines.append("- **反向证据**:")
+            for item in counterevidence:
+                lines.append(f"  - {item}")
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -145,6 +295,57 @@ def extract_rejections(rejections: list[dict] | None) -> str:
             lines.append(f"  - ❌ {v}")
     lines.append("")
     return "\n".join(lines)
+
+
+def _trace_source_trial_id(trace: dict) -> int | None:
+    """找出一次 Agent trace 实际分析的是哪个已完成 Trial。"""
+    proposal = trace.get("proposal_conversation")
+    if isinstance(proposal, dict):
+        context = proposal.get("context")
+        if isinstance(context, dict):
+            last_trial = context.get("last_trial")
+            if isinstance(last_trial, dict) and isinstance(
+                last_trial.get("trial_id"), int
+            ):
+                return last_trial["trial_id"]
+
+    diagnosis = trace.get("diagnosis")
+    if isinstance(diagnosis, dict):
+        context = diagnosis.get("context")
+        if isinstance(context, dict):
+            diagnosed_trial = context.get("trial")
+            if isinstance(diagnosed_trial, dict) and isinstance(
+                diagnosed_trial.get("trial_id"), int
+            ):
+                return diagnosed_trial["trial_id"]
+    return None
+
+
+def _trace_tool_counts(trace: dict) -> tuple[int, int, int]:
+    """返回 Diagnosis、Proposal、Feasibility 的工具调用数。"""
+    diagnosis = trace.get("diagnosis")
+    diagnosis_count = (
+        len(_feasibility_tool_calls(diagnosis))
+        if isinstance(diagnosis, dict)
+        else 0
+    )
+
+    proposal = trace.get("proposal_conversation")
+    proposal_count = (
+        len(_feasibility_tool_calls(proposal))
+        if isinstance(proposal, dict)
+        else 0
+    )
+
+    feasibility = trace.get("feasibility_reviews") or []
+    if isinstance(feasibility, dict):
+        feasibility = [feasibility]
+    feasibility_count = sum(
+        len(_feasibility_tool_calls(review))
+        for review in feasibility
+        if isinstance(review, dict)
+    )
+    return diagnosis_count, proposal_count, feasibility_count
 
 
 def _fmt(val, spec=".1f"):
@@ -274,6 +475,20 @@ def process_experiment(exp_dir: Path, output_path: Path) -> None:
             if line:
                 trials.append(json.loads(line))
 
+    # agent_trace 随“候选 Trial”保存，但其中的 Agent 行为发生在上一个
+    # Trial 完成之后。报告按被分析的源 Trial 归属，避免 Trial 5 这类
+    # 阶段基准 Trial 显示成“没有 Agent 行为”。
+    actions_by_source: dict[int, list[tuple[dict, dict]]] = {}
+    for index, target_trial in enumerate(trials):
+        trace = target_trial.get("agent_trace")
+        if not isinstance(trace, dict) or not trace:
+            continue
+        source_id = _trace_source_trial_id(trace)
+        if source_id is None and index > 0:
+            source_id = trials[index - 1].get("trial_id")
+        if isinstance(source_id, int):
+            actions_by_source.setdefault(source_id, []).append((target_trial, trace))
+
     # 提取实验时间戳
     exp_name = exp_dir.name
     ts_match = None
@@ -295,8 +510,8 @@ def process_experiment(exp_dir: Path, output_path: Path) -> None:
     lines.append("")
 
     # 试验总览表
-    lines.append("| Trial | 阶段 | 结果 | 吞吐量 | Reward (均值) | Reward (最大) | 显存峰值% | Agent 工具调用 |")
-    lines.append("|---|---|---|---:|---:|---:|---:|:---:|")
+    lines.append("| Trial | 阶段 | 结果 | 吞吐量 | Reward (均值) | Reward (最大) | 显存峰值% | Health 决策 | 完成后的 Agent 工具调用（D + P + F） |")
+    lines.append("|---|---|---|---:|---:|---:|---:|:---:|:---:|")
     for t in trials:
         tid = t.get("trial_id", "?")
         stage = t.get("stage", "?")
@@ -313,11 +528,27 @@ def process_experiment(exp_dir: Path, output_path: Path) -> None:
         mem = t.get("resource", {}).get("max_observed_memory_pct", "-")
         if isinstance(mem, (int, float)):
             mem = f"{mem:.1f}%"
-        n_tools = len(t.get("agent_trace", {}).get("proposal_conversation", {}).get("tool_calls", []))
-        tool_str = str(n_tools) if n_tools else "-"
+        diagnosis_tools = 0
+        proposal_tools = 0
+        feasibility_tools = 0
+        for _, trace in actions_by_source.get(tid, []):
+            d_count, p_count, f_count = _trace_tool_counts(trace)
+            diagnosis_tools += d_count
+            proposal_tools += p_count
+            feasibility_tools += f_count
+        total_tools = diagnosis_tools + proposal_tools + feasibility_tools
+        tool_str = (
+            f"{diagnosis_tools} + {proposal_tools} + "
+            f"{feasibility_tools} = {total_tools}"
+            if total_tools
+            else "-"
+        )
+        health_count = len(t.get("health_decisions") or [])
+        health_str = str(health_count) if health_count else "-"
 
         lines.append(
-            f"| {tid} | {stage} | {result} | {tp} | {rw_mean} | {rw_max} | {mem} | {tool_str} |"
+            f"| {tid} | {stage} | {result} | {tp} | {rw_mean} | {rw_max} "
+            f"| {mem} | {health_str} | {tool_str} |"
         )
     lines.append("")
 
@@ -359,51 +590,59 @@ def process_experiment(exp_dir: Path, output_path: Path) -> None:
         # 关键指标
         lines.append(extract_metrics(t))
 
-        # Agent 行为
-        trace = t.get("agent_trace")
-        if trace:
-            conv = trace.get("proposal_conversation", {})
-            tool_calls = conv.get("tool_calls", [])
+        # Health Monitor 决策发生在当前 Trial 运行期间。
+        health_decisions = t.get("health_decisions") or []
+        if health_decisions:
+            lines.append(extract_health_decisions(health_decisions))
 
-            lines.append("### Agent 行为分析")
+        # 其他 Agent 行为按“该 Trial 完成之后”归属；trace 本身保存在目标 Trial。
+        actions = actions_by_source.get(tid, [])
+        if actions:
+            lines.append("### 本 Trial 完成后的 Agent 行为")
             lines.append("")
 
-            if tool_calls:
-                lines.append(f"**工具调用 ({len(tool_calls)} 次):**")
-                lines.append("")
-                lines.append(extract_tool_calls(tool_calls))
-                lines.append("")
-
-            # Proposal 决策
-            proposal = t.get("proposal", {})
-            if proposal:
-                lines.append("#### Agent 决策")
-                lines.append("")
-                lines.append(extract_proposal_changes(proposal))
+            for target_trial, trace in actions:
+                target_id = target_trial.get("trial_id", "?")
+                lines.append(f"_以下行为用于生成 Trial {target_id} 的候选配置。_")
                 lines.append("")
 
-            # Feasibility
-            feas = trace.get("feasibility_reviews", [])
-            if feas:
-                lines.append(extract_feasibility(feas))
+                diagnosis = trace.get("diagnosis")
+                if diagnosis:
+                    lines.append(extract_diagnosis(diagnosis))
 
-            # Rejections
-            rejs = trace.get("rejections", [])
-            if rejs:
-                lines.append(extract_rejections(rejs))
+                conv = trace.get("proposal_conversation") or {}
+                tool_calls = _feasibility_tool_calls(conv)
+                if conv:
+                    lines.append("#### Proposal Agent 决策")
+                    lines.append("")
+                    if tool_calls:
+                        lines.append(
+                            f"**Proposal 工具调用 ({len(tool_calls)} 次):**"
+                        )
+                        lines.append("")
+                        lines.append(extract_tool_calls(tool_calls))
+                        lines.append("")
 
-            # 诊断
-            diagnosis = trace.get("diagnosis")
-            if diagnosis:
-                lines.append(f"**诊断信息**: {diagnosis}")
-                lines.append("")
+                    proposal = conv.get("result")
+                    if not isinstance(proposal, dict):
+                        proposal = target_trial.get("proposal", {})
+                    lines.append(extract_proposal_changes(proposal))
+                    lines.append("")
+
+                feas = trace.get("feasibility_reviews", [])
+                if feas:
+                    lines.append(extract_feasibility(feas))
+
+                rejs = trace.get("rejections", [])
+                if rejs:
+                    lines.append(extract_rejections(rejs))
         else:
-            lines.append("### Agent 行为分析")
+            lines.append("### 本 Trial 完成后的 Agent 行为")
             lines.append("")
-            if tid == 1:
-                lines.append("_Trial 1 是基准试验，无需 Agent 提出变更建议。_")
+            if idx == len(trials) - 1:
+                lines.append("_这是最后一个 Trial，记录中没有后续 Agent trace。_")
             else:
-                lines.append("_无 agent_trace 数据。_")
+                lines.append("_该 Trial 完成后没有记录 Diagnosis、Proposal 或 Feasibility trace。_")
             lines.append("")
 
         # 实验日志路径
