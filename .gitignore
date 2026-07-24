@@ -1,12 +1,9 @@
 # User credentials — do not commit.
 env.sh
-<<<<<<< HEAD
-=======
 id_ed25519
 id_ed25519.pub
 
-# Python cache
-__pycache__/
-*.pyc
-
->>>>>>> 0e7805ca100e8cc77882942b9cedd4ad1b9f1a3b
+# Python caches
+**/__pycache__/
+*.py[cod]
+**/.pytest_cache/

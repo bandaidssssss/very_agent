@@ -3,15 +3,23 @@
 提取实验目录中每个 trial 的 agent 行为（工具调用、参数变更、决策原因）并生成 Markdown 报告。
 
 用法:
+    python3 output/extract_agent_trace.py
     python3 extract_agent_trace.py ssh_agent/output/0720_1656_2026 [output.md]
+
+直接修改下方 ``DEFAULT_EXPERIMENT_DIR`` 即可更换无参数运行时的实验目录。
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from datetime import datetime
 from pathlib import Path
+
+
+DEFAULT_EXPERIMENT_DIR = Path(__file__).resolve().parent / "0723_1550_2026"
+DEFAULT_OUTPUT_NAME = "agent_report.md"
 
 
 def _compact_json(obj, max_len=120):
@@ -416,16 +424,27 @@ def process_experiment(exp_dir: Path, output_path: Path) -> None:
 
 
 def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="提取实验目录中的 Agent 行为并生成 Markdown 报告。"
+    )
+    parser.add_argument(
+        "experiment_dir",
+        nargs="?",
+        type=Path,
+        default=DEFAULT_EXPERIMENT_DIR,
+        help=f"实验目录（默认：{DEFAULT_EXPERIMENT_DIR}）",
+    )
+    parser.add_argument(
+        "--output-name",
+        default=DEFAULT_OUTPUT_NAME,
+        help="写入实验目录内的 Markdown 文件名",
+    )
+    args = parser.parse_args()
+    if Path(args.output_name).name != args.output_name:
+        parser.error("--output-name 必须是文件名，不能是路径")
 
-    exp_dir = Path(sys.argv[1]).resolve()
-    if len(sys.argv) >= 3:
-        output_path = Path(sys.argv[2]).resolve()
-    else:
-        output_path = exp_dir / "agent_report.md"
-
+    exp_dir = args.experiment_dir.expanduser().resolve()
+    output_path = exp_dir / args.output_name
     process_experiment(exp_dir, output_path)
 
 
